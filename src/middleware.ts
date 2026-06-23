@@ -60,9 +60,12 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(url)
   }
 
-  // API routes that need auth (not webhooks)
+  // API routes that need auth — but NOT the public machine endpoints:
+  // webhooks (Meta signature-verified) and cron endpoints (their own
+  // x-cron-secret auth, called by pg_cron with no user session).
   if (!user && request.nextUrl.pathname.startsWith('/api/whatsapp/') &&
-      !request.nextUrl.pathname.includes('/webhook')) {
+      !request.nextUrl.pathname.includes('/webhook') &&
+      !request.nextUrl.pathname.endsWith('/cron')) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
