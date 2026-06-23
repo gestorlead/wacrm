@@ -182,6 +182,10 @@ export interface Message {
   template_name?: string;
   message_id?: string;
   status: MessageStatus;
+  /** Meta's numeric error code when status === 'failed' (e.g. '131047'). */
+  error_code?: string;
+  /** Human-readable failure reason from Meta when status === 'failed'. */
+  error_text?: string;
   created_at: string;
   reply_to_message_id?: string;
   /**

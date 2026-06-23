@@ -22,6 +22,14 @@ import {
 import type { MessageTemplate } from '@/types'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
 
+/** Best-effort extraction of Meta's numeric error code from an error
+ *  message (e.g. "(#131047) Re-engagement message..."). Returns null when
+ *  no code is present — error_text still carries the full reason. */
+function parseMetaErrorCode(message: string): string | null {
+  const m = message.match(/\(#(\d+)\)/) || message.match(/\bcode[:\s]+(\d+)/i)
+  return m ? m[1] : null
+}
+
 export async function POST(request: Request) {
   try {
     const supabase = await createClient()
@@ -314,6 +322,46 @@ export async function POST(request: Request) {
       return result.messageId
     }
 
+    // Pre-insert the outbound row as 'sending' BEFORE calling Meta. This
+    // guarantees the message always has a local record: on success we
+    // stamp the Meta id and flip to 'sent'; on failure we mark it 'failed'
+    // with Meta's reason. Replaces the old path where a Meta-accepted-but-
+    // DB-insert-failed send vanished from the CRM. The UI shows it
+    // optimistically and the status flips via realtime.
+    const { data: messageRecord, error: preInsertError } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id,
+        sender_type: 'agent',
+        content_type: message_type,
+        content_text: content_text || null,
+        media_url: media_url || null,
+        template_name: template_name || null,
+        message_id: null,
+        status: 'sending',
+        reply_to_message_id: reply_to_message_id || null,
+      })
+      .select()
+      .single()
+
+    if (preInsertError || !messageRecord) {
+      console.error('Error pre-inserting message:', preInsertError)
+      return NextResponse.json(
+        { error: 'Failed to save the message before sending.' },
+        { status: 500 }
+      )
+    }
+
+    // Surface it in the conversation list immediately (optimistic).
+    await supabase
+      .from('conversations')
+      .update({
+        last_message_text: content_text || `[${message_type}]`,
+        last_message_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', conversation_id)
+
     try {
       const variants = phoneVariants(sanitizedPhone)
       let lastError: unknown = null
@@ -341,9 +389,35 @@ export async function POST(request: Request) {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown Meta API error'
       console.error('Meta API send failed for all variants:', message)
+      // Mark the pre-inserted row as failed WITH the reason, so the agent
+      // sees WHY in the thread instead of the message disappearing.
+      await supabase
+        .from('messages')
+        .update({
+          status: 'failed',
+          error_code: parseMetaErrorCode(message),
+          error_text: message,
+        })
+        .eq('id', messageRecord.id)
       return NextResponse.json(
-        { error: `Meta API error: ${message}` },
+        { error: `Meta API error: ${message}`, message_id: messageRecord.id },
         { status: 502 }
+      )
+    }
+
+    // Success — stamp the Meta id and flip to 'sent'.
+    const { error: finalizeError } = await supabase
+      .from('messages')
+      .update({ message_id: waMessageId, status: 'sent' })
+      .eq('id', messageRecord.id)
+    if (finalizeError) {
+      // The message reached Meta and the local row exists — only the
+      // id/status stamp failed. Don't 500 (the message isn't lost); log
+      // loudly. Downside: a delivery-status webhook keyed on message_id
+      // can't match this row until it's reconciled.
+      console.error(
+        '[whatsapp/send] failed to stamp Meta id on message:',
+        finalizeError.message,
       )
     }
 
@@ -359,44 +433,6 @@ export async function POST(request: Request) {
         .update({ phone: workingPhone })
         .eq('id', contact.id)
     }
-
-    // Insert message into DB — field names MUST match the messages schema
-    // (see supabase/migrations/001_initial_schema.sql):
-    //   conversation_id, sender_type, content_type, content_text,
-    //   media_url, template_name, message_id, status, created_at
-    const { data: messageRecord, error: msgError } = await supabase
-      .from('messages')
-      .insert({
-        conversation_id,
-        sender_type: 'agent',
-        content_type: message_type,
-        content_text: content_text || null,
-        media_url: media_url || null,
-        template_name: template_name || null,
-        message_id: waMessageId,
-        status: 'sent',
-        reply_to_message_id: reply_to_message_id || null,
-      })
-      .select()
-      .single()
-
-    if (msgError) {
-      console.error('Error inserting sent message:', msgError)
-      return NextResponse.json(
-        { error: `Message sent to Meta but failed to save to DB: ${msgError.message}` },
-        { status: 500 }
-      )
-    }
-
-    // Update conversation
-    await supabase
-      .from('conversations')
-      .update({
-        last_message_text: content_text || `[${message_type}]`,
-        last_message_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', conversation_id)
 
     // Pause any active Flow run for this contact — the agent stepping
     // in is the strongest "yield, human is here" signal. See PR #2

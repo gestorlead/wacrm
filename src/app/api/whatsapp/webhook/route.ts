@@ -87,6 +87,8 @@ interface WhatsAppWebhookEntry {
         status: string
         timestamp: string
         recipient_id: string
+        /** Present on status 'failed' — Meta's reason (code + title). */
+        errors?: Array<{ code?: number; title?: string; message?: string; href?: string }>
       }>
       /**
        * Coexistence (field 'smb_message_echoes'): echoes of messages the
@@ -369,12 +371,22 @@ async function handleStatusUpdate(status: {
   status: string
   timestamp: string
   recipient_id: string
+  errors?: Array<{ code?: number; title?: string; message?: string; href?: string }>
 }) {
   // 1) Mirror onto messages (legacy behavior) — Meta's status values
-  //    already match the CHECK constraint on messages.status.
+  //    already match the CHECK constraint on messages.status. On a
+  //    'failed' status, also capture Meta's reason so the agent sees
+  //    WHY (e.g. 131047 re-engagement, 470 outside the 24h window)
+  //    instead of a bare "failed".
+  const messageUpdate: Record<string, unknown> = { status: status.status }
+  if (status.status === 'failed' && status.errors?.length) {
+    const err = status.errors[0]
+    messageUpdate.error_code = err.code != null ? String(err.code) : null
+    messageUpdate.error_text = err.title || err.message || null
+  }
   const { error: msgErr } = await supabaseAdmin()
     .from('messages')
-    .update({ status: status.status })
+    .update(messageUpdate)
     .eq('message_id', status.id)
 
   if (msgErr) {
@@ -803,6 +815,13 @@ async function processMessage(
     return
   }
 
+  // Dedup: Meta redelivers webhooks (we ack 200 then process async, so a
+  // slow/failed run makes Meta retry). Skip if we already stored this
+  // message_id — this also avoids re-firing flows/automations for a
+  // redelivery and skips the wasteful media fetch below. The partial
+  // UNIQUE index on message_id (migration 027) is the concurrency backstop.
+  if (await messageAlreadyStored(message.id)) return
+
   // Parse message content based on type
   const { contentText, mediaUrl, mediaType, interactiveReplyId } =
     await parseMessageContent(message, accessToken)
@@ -862,6 +881,11 @@ async function processMessage(
   })
 
   if (msgError) {
+    // A concurrent redelivery raced past the dedup check above and
+    // inserted this exact message_id first — the UNIQUE index rejected
+    // ours. That's benign: the winning delivery owns the conversation
+    // bump + dispatch, so just stop here without the scary error log.
+    if (isUniqueViolation(msgError)) return
     console.error('Error inserting message:', msgError)
     return
   }
