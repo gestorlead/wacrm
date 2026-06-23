@@ -11,6 +11,10 @@ import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
+import {
+  persistWebhookEvent,
+  runEventInline,
+} from '@/lib/whatsapp/webhook-outbox'
 
 // Lazy-initialized to avoid build-time crash when env vars are missing
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -209,15 +213,30 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
   }
 
-  // Process asynchronously so we can ack Meta within their timeout.
-  processWebhook(body).catch((error) => {
-    console.error('Error processing webhook:', error)
-  })
+  // Durably record the event BEFORE acking Meta. If we can't persist it,
+  // return 500 so Meta retries — we must never ack an event we might lose.
+  let event
+  try {
+    event = await persistWebhookEvent(signature, body)
+  } catch (err) {
+    console.error('[webhook] failed to persist event:', err)
+    return NextResponse.json({ error: 'Failed to record event' }, { status: 500 })
+  }
+
+  // Ack within Meta's timeout. `event === null` means a redelivery we
+  // already have — nothing to do. Otherwise process the happy path
+  // inline (low latency); the cron drain (/api/whatsapp/webhook/process)
+  // is the retry + dead-letter safety net for anything that fails here.
+  if (event) {
+    runEventInline(event, processWebhook).catch((error) => {
+      console.error('Error processing webhook inline:', error)
+    })
+  }
 
   return NextResponse.json({ status: 'received' }, { status: 200 })
 }
 
-async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
+export async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
   if (!body.entry) return
 
   for (const entry of body.entry) {
@@ -275,15 +294,16 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         .eq('phone_number_id', phoneNumberId)
 
       if (configError) {
-        console.error(
-          'Error fetching whatsapp_config for phone_number_id:',
-          phoneNumberId,
-          configError
+        // A DB error (not "no rows") is transient/retryable — throw so
+        // the outbox marks this event failed and the cron retries it,
+        // rather than silently dropping the message.
+        throw new Error(
+          `whatsapp_config lookup failed for ${phoneNumberId}: ${configError.message}`
         )
-        continue
       }
 
       if (!configRows || configRows.length === 0) {
+        // Not our number — nothing to retry. Treat as processed.
         console.error('No config found for phone_number_id:', phoneNumberId)
         continue
       }
