@@ -173,6 +173,36 @@ export async function POST(request: Request) {
       )
     }
 
+    // WhatsApp 24-hour customer service window: free-form (non-template)
+    // messages are only deliverable within 24h of the contact's last
+    // inbound message. Outside it, Meta rejects the send — pre-empt with a
+    // clear error so the agent knows to send an approved template to
+    // re-open the conversation (mirrors Chatwoot's MessageWindowService).
+    if (message_type !== 'template') {
+      const { data: lastInbound } = await supabase
+        .from('messages')
+        .select('created_at')
+        .eq('conversation_id', conversation_id)
+        .eq('sender_type', 'customer')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      const withinWindow =
+        !!lastInbound &&
+        Date.now() - new Date(lastInbound.created_at).getTime() <
+          24 * 60 * 60 * 1000
+      if (!withinWindow) {
+        return NextResponse.json(
+          {
+            error:
+              'Outside the 24-hour WhatsApp service window. Send an approved template to re-open the conversation.',
+            code: 'outside_24h_window',
+          },
+          { status: 409 }
+        )
+      }
+    }
+
     // Fetch and decrypt WhatsApp config
     const { data: config, error: configError } = await supabase
       .from('whatsapp_config')
