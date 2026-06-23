@@ -43,6 +43,12 @@ interface BroadcastPayload {
 
 interface UseBroadcastSendingReturn {
   createAndSendBroadcast: (payload: BroadcastPayload) => Promise<string>;
+  /** Snapshot the audience + per-recipient params and store the broadcast
+   *  as 'scheduled'. The server-side cron sends it at `scheduledAt`. */
+  scheduleBroadcast: (
+    payload: BroadcastPayload,
+    scheduledAt: string,
+  ) => Promise<string>;
   isProcessing: boolean;
   progress: number;
 }
@@ -550,5 +556,113 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     }
   }
 
-  return { createAndSendBroadcast, isProcessing, progress };
+  /**
+   * Schedule a broadcast for later. Unlike createAndSendBroadcast, this
+   * does NOT send — it resolves the audience and SNAPSHOTS each
+   * recipient's resolved body params onto broadcast_recipients.params,
+   * then stores the broadcast as 'scheduled'. The server-side cron
+   * (/api/broadcasts/cron) sends to those snapshotted recipients at
+   * `scheduled_at`, so no browser logic runs at send time.
+   */
+  async function scheduleBroadcast(
+    payload: BroadcastPayload,
+    scheduledAt: string,
+  ): Promise<string> {
+    setIsProcessing(true);
+    setProgress(0);
+    const supabase = createClient();
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const user = session?.user;
+      if (!user) throw new Error('You are not signed in.');
+      if (!accountId) throw new Error('Your profile is not linked to an account.');
+
+      setProgress(10);
+      const contacts = await resolveAudience(payload.audience);
+      if (contacts.length === 0) {
+        throw new Error('No contacts found for this audience.');
+      }
+
+      setProgress(30);
+      const customValueIndex = await fetchCustomValueIndex(
+        supabase,
+        contacts.map((c) => c.id),
+      );
+
+      setProgress(50);
+      const { data: broadcast, error: broadcastError } = await supabase
+        .from('broadcasts')
+        .insert({
+          user_id: user.id,
+          account_id: accountId,
+          name: payload.name,
+          template_name: payload.template.name,
+          template_language: payload.template.language ?? 'en_US',
+          template_variables: payload.variables,
+          audience_filter: {
+            type: payload.audience.type,
+            tagIds: payload.audience.tagIds,
+            customField: payload.audience.customField,
+            excludeTagIds: payload.audience.excludeTagIds,
+          },
+          status: 'scheduled',
+          scheduled_at: scheduledAt,
+          total_recipients: contacts.length,
+          sent_count: 0,
+          delivered_count: 0,
+          read_count: 0,
+          replied_count: 0,
+          failed_count: 0,
+        })
+        .select()
+        .single();
+
+      if (broadcastError || !broadcast) {
+        throw new Error(
+          `Failed to schedule broadcast: ${broadcastError?.message ?? 'unknown error'}`,
+        );
+      }
+
+      // Snapshot recipients WITH their resolved params so the cron sends
+      // exactly what was personalized now, even if contacts change later.
+      setProgress(70);
+      const recipientRows = contacts.map((contact) => ({
+        broadcast_id: broadcast.id,
+        contact_id: contact.id,
+        status: 'pending' as const,
+        params: resolveVariables(
+          payload.variables,
+          contact,
+          customValueIndex.get(contact.id),
+        ),
+      }));
+
+      for (let i = 0; i < recipientRows.length; i += INSERT_BATCH_SIZE) {
+        const batch = recipientRows.slice(i, i + INSERT_BATCH_SIZE);
+        const { error: recipientError } = await supabase
+          .from('broadcast_recipients')
+          .insert(batch);
+        if (recipientError) {
+          // Roll back to draft so the user can retry rather than leaving a
+          // scheduled broadcast with a partial recipient set.
+          await supabase
+            .from('broadcasts')
+            .update({ status: 'draft', scheduled_at: null })
+            .eq('id', broadcast.id);
+          throw new Error(
+            `Failed to snapshot recipients: ${recipientError.message}`,
+          );
+        }
+      }
+
+      setProgress(100);
+      return broadcast.id;
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  return { createAndSendBroadcast, scheduleBroadcast, isProcessing, progress };
 }

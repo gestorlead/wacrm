@@ -23,7 +23,8 @@ const steps = [
 export default function NewBroadcastPage() {
   const router = useRouter();
   const { accountId } = useAuth();
-  const { createAndSendBroadcast, isProcessing, progress } = useBroadcastSending();
+  const { createAndSendBroadcast, scheduleBroadcast, isProcessing, progress } =
+    useBroadcastSending();
 
   const [currentStep, setCurrentStep] = useState(0);
   const [template, setTemplate] = useState<MessageTemplate | null>(null);
@@ -65,6 +66,33 @@ export default function NewBroadcastPage() {
       // just no-op, leaving the user confused. Surface the reason.
       const message = err instanceof Error ? err.message : 'Broadcast failed';
       console.error('Broadcast failed:', err);
+      toast.error(message);
+    }
+  }
+
+  async function handleSchedule(scheduledAtIso: string) {
+    if (!template) return;
+    try {
+      const broadcastId = await scheduleBroadcast(
+        {
+          name,
+          template,
+          audience: {
+            type: audience.type,
+            tagIds: audience.tagIds,
+            customField: audience.customField,
+            csvContacts: audience.csvContacts,
+            excludeTagIds: audience.excludeTagIds,
+          },
+          variables,
+        },
+        scheduledAtIso,
+      );
+      toast.success('Broadcast scheduled');
+      router.push(`/broadcasts/${broadcastId}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to schedule';
+      console.error('Schedule failed:', err);
       toast.error(message);
     }
   }
@@ -216,6 +244,7 @@ export default function NewBroadcastPage() {
               template={template}
               audience={audience}
               onSend={handleSend}
+              onSchedule={handleSchedule}
               onSaveDraft={handleSaveDraft}
               onBack={() => setCurrentStep(2)}
               isProcessing={isProcessing}

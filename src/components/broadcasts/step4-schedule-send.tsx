@@ -14,7 +14,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog';
-import { ArrowLeft, Send, Loader2, Users, Save } from 'lucide-react';
+import { ArrowLeft, Send, Loader2, Users, Save, CalendarClock } from 'lucide-react';
 
 interface AudienceConfig {
   type: string;
@@ -28,6 +28,8 @@ interface Step4Props {
   template: MessageTemplate;
   audience: AudienceConfig;
   onSend: () => void;
+  /** Schedule for later — receives an ISO timestamp. */
+  onSchedule?: (scheduledAtIso: string) => void;
   onSaveDraft?: () => void;
   onBack: () => void;
   isProcessing: boolean;
@@ -40,6 +42,7 @@ export function Step4ScheduleSend({
   template,
   audience,
   onSend,
+  onSchedule,
   onSaveDraft,
   onBack,
   isProcessing,
@@ -48,6 +51,16 @@ export function Step4ScheduleSend({
   const [showConfirm, setShowConfirm] = useState(false);
   const [estimatedReach, setEstimatedReach] = useState<number>(0);
   const [loadingReach, setLoadingReach] = useState(true);
+  // datetime-local value (local time, no timezone) for scheduling.
+  const [scheduledLocal, setScheduledLocal] = useState('');
+  // Minimum selectable time = ~2 min from now, formatted for datetime-local.
+  const minLocal = (() => {
+    const d = new Date(Date.now() + 2 * 60 * 1000);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  })();
+  const scheduledIsValid =
+    scheduledLocal !== '' && new Date(scheduledLocal).getTime() > Date.now();
 
   useEffect(() => {
     async function calculateReach() {
@@ -158,6 +171,44 @@ export function Step4ScheduleSend({
               style={{ width: `${progress}%` }}
             />
           </div>
+        </div>
+      )}
+
+      {/* Schedule for later */}
+      {onSchedule && (
+        <div className="rounded-xl border border-border bg-card/50 p-4 space-y-2">
+          <div className="flex items-center gap-2">
+            <CalendarClock className="h-4 w-4 text-primary" />
+            <p className="text-sm font-medium text-foreground">Schedule for later</p>
+            <span className="text-xs text-muted-foreground">(optional)</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              type="datetime-local"
+              value={scheduledLocal}
+              min={minLocal}
+              onChange={(e) => setScheduledLocal(e.target.value)}
+              disabled={isProcessing}
+              className="w-auto border-border bg-muted text-foreground"
+            />
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (!scheduledIsValid) return;
+                // Convert local wall-clock to an absolute ISO instant.
+                onSchedule(new Date(scheduledLocal).toISOString());
+              }}
+              disabled={!name.trim() || !scheduledIsValid || isProcessing}
+              className="border-border text-foreground hover:bg-muted disabled:opacity-50"
+            >
+              <CalendarClock className="h-4 w-4" />
+              Schedule
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            The audience and personalization are captured now; the broadcast
+            is sent automatically at the time you pick.
+          </p>
         </div>
       )}
 
