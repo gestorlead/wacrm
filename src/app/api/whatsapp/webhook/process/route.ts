@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server'
-import { drainWebhookEvents } from '@/lib/whatsapp/webhook-outbox'
+import {
+  drainWebhookEvents,
+  sweepStuckSendingMessages,
+} from '@/lib/whatsapp/webhook-outbox'
 import { processWebhook } from '@/app/api/whatsapp/webhook/route'
 
 /**
@@ -25,7 +28,8 @@ export async function GET(request: Request) {
 
   try {
     const result = await drainWebhookEvents(processWebhook, 50)
-    return NextResponse.json(result)
+    const sweptStuck = await sweepStuckSendingMessages()
+    return NextResponse.json({ ...result, sweptStuck })
   } catch (err) {
     console.error('[webhook/process] drain failed:', err)
     return NextResponse.json(

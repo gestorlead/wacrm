@@ -61,6 +61,11 @@ interface WhatsAppMessage {
    * routes on `interactive.button_reply.id`.
    */
   button?: { text: string; payload: string }
+  /** Shared contact card(s) (vCard) — each has a name + phone list. */
+  contacts?: Array<{
+    name?: { formatted_name?: string; first_name?: string; last_name?: string }
+    phones?: Array<{ phone?: string; wa_id?: string; type?: string }>
+  }>
   /** Present when the customer swipe-replies to one of our messages. */
   context?: { id: string }
   /**
@@ -546,7 +551,7 @@ async function storeOutboundEcho(echo: WhatsAppMessage, config: any, accessToken
   // Reactions aren't standalone messages — skip (same as the inbound path).
   if (echo.type === 'reaction') return
 
-  const { contentText, mediaUrl, interactiveReplyId } = await parseMessageContent(echo, accessToken)
+  const { contentText, mediaUrl, interactiveReplyId } = await parseMessageContent(echo, accessToken, config.account_id)
   const createdAt = new Date(parseInt(echo.timestamp) * 1000).toISOString()
 
   const { error } = await supabaseAdmin().from('messages').insert({
@@ -647,7 +652,7 @@ async function storeHistoricalMessage(
   )
   if (!conversation) return
 
-  const { contentText, mediaUrl, interactiveReplyId } = await parseMessageContent(msg, accessToken)
+  const { contentText, mediaUrl, interactiveReplyId } = await parseMessageContent(msg, accessToken, config.account_id)
   const createdAt = new Date(parseInt(msg.timestamp) * 1000).toISOString()
 
   const { error } = await supabaseAdmin().from('messages').insert({
@@ -844,7 +849,7 @@ async function processMessage(
 
   // Parse message content based on type
   const { contentText, mediaUrl, mediaType, interactiveReplyId } =
-    await parseMessageContent(message, accessToken)
+    await parseMessageContent(message, accessToken, accountId)
 
   // Resolve swipe-reply context if present. A missing parent is fine —
   // we just store NULL and the UI renders the message without a quote.
@@ -1009,9 +1014,23 @@ async function processMessage(
   }
 }
 
+/** Map a MIME type to a file extension for the persisted media object. */
+function extFromMime(mime: string): string {
+  const map: Record<string, string> = {
+    'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
+    'video/mp4': 'mp4', 'video/3gpp': '3gp',
+    'audio/ogg': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/amr': 'amr',
+    'application/pdf': 'pdf',
+  }
+  return map[mime.split(';')[0].trim()] || 'bin'
+}
+
 async function parseMessageContent(
   message: WhatsAppMessage,
-  accessToken: string
+  accessToken: string,
+  // account_id of the connected number — namespaces persisted media in
+  // the public chat-media bucket (account-<id>/...).
+  accountId: string
 ): Promise<{
   contentText: string | null
   mediaUrl: string | null
@@ -1032,9 +1051,9 @@ async function parseMessageContent(
   const verifyAndBuildUrl = async (
     mediaId: string
   ): Promise<string | null> => {
+    let info: { url: string; mimeType: string }
     try {
-      await getMediaUrl({ mediaId, accessToken })
-      return `/api/whatsapp/media/${mediaId}`
+      info = await getMediaUrl({ mediaId, accessToken })
     } catch (error) {
       console.error(
         `Failed to verify media ${mediaId} with Meta:`,
@@ -1042,6 +1061,35 @@ async function parseMessageContent(
       )
       return null
     }
+
+    // Persist into the PUBLIC chat-media bucket so the media survives
+    // Meta's ~30-day GC and loads from our CDN instead of round-tripping
+    // to Meta on every view. Best-effort — any failure falls back to the
+    // authenticated live proxy (the previous behavior), so a storage hiccup
+    // can never break message ingest.
+    try {
+      const { buffer, contentType } = await downloadMedia({
+        downloadUrl: info.url,
+        accessToken,
+      })
+      const mime = contentType || info.mimeType || 'application/octet-stream'
+      const path = `account-${accountId}/wa-${mediaId}.${extFromMime(mime)}`
+      const { error: upErr } = await supabaseAdmin()
+        .storage.from('chat-media')
+        .upload(path, buffer, { contentType: mime, upsert: true })
+      if (upErr) {
+        console.warn('[webhook] media persist upload failed, using proxy:', upErr.message)
+      } else {
+        const { data } = supabaseAdmin().storage.from('chat-media').getPublicUrl(path)
+        if (data?.publicUrl) return data.publicUrl
+      }
+    } catch (e) {
+      console.warn(
+        '[webhook] media persist failed, using proxy:',
+        e instanceof Error ? e.message : e
+      )
+    }
+    return `/api/whatsapp/media/${mediaId}`
   }
 
   // Default shape — each case overrides only the fields it cares about.
@@ -1154,6 +1202,27 @@ async function parseMessageContent(
         ...empty,
         contentText: message.button?.text || message.button?.payload || null,
         interactiveReplyId: message.button?.payload ?? null,
+      }
+    }
+
+    case 'contacts': {
+      // Shared contact card(s). Render a readable summary (name — phones)
+      // as text; stored with content_type 'text' (mapContentType coerces
+      // unknown types). Better than the old "[Unsupported]" fallback.
+      const cards = (message.contacts ?? []).map((c) => {
+        const name =
+          c.name?.formatted_name ||
+          [c.name?.first_name, c.name?.last_name].filter(Boolean).join(' ') ||
+          'Contato'
+        const phones = (c.phones ?? [])
+          .map((p) => p.phone)
+          .filter(Boolean)
+          .join(', ')
+        return phones ? `👤 ${name} — ${phones}` : `👤 ${name}`
+      })
+      return {
+        ...empty,
+        contentText: cards.join('\n') || '[Contato compartilhado]',
       }
     }
 

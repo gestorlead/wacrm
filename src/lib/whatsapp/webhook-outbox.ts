@@ -170,3 +170,30 @@ export async function drainWebhookEvents(
   }
   return { due: due.length, claimed, processed, failed }
 }
+
+/** Messages stuck in 'sending' this long are presumed interrupted. */
+const STUCK_SENDING_MINUTES = 10
+
+/**
+ * Age out messages stranded in 'sending' — the send route crashed between
+ * the pre-insert and the Meta call resolving, so they'd otherwise show a
+ * permanent spinner. Flip them to 'failed' with a reason. Called from the
+ * same cron drain so no extra schedule is needed.
+ */
+export async function sweepStuckSendingMessages(): Promise<number> {
+  const cutoff = new Date(Date.now() - STUCK_SENDING_MINUTES * 60_000).toISOString()
+  const { data, error } = await supabaseAdmin()
+    .from('messages')
+    .update({
+      status: 'failed',
+      error_text: 'Send interrupted before Meta confirmed delivery (timed out).',
+    })
+    .eq('status', 'sending')
+    .lt('created_at', cutoff)
+    .select('id')
+  if (error) {
+    console.error('[webhook-outbox] stuck-sending sweep failed:', error.message)
+    return 0
+  }
+  return data?.length ?? 0
+}
