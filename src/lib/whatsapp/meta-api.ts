@@ -9,7 +9,11 @@
  * instead of a runtime rejection from Meta.
  */
 
-const META_API_VERSION = 'v21.0'
+// Graph API version. Defaults to v22.0 — Embedded Signup / Coexistence
+// onboarding and the `smb_message_echoes` webhook field require v22.0+.
+// All other endpoints used here are stable across v21→v22, so a single
+// env-driven base lifts the whole client at once.
+const META_API_VERSION = process.env.META_API_VERSION || 'v22.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 
 export interface MetaSendResult {
@@ -63,6 +67,96 @@ export async function verifyPhoneNumber(
     await throwMetaError(response, `Meta API error: ${response.status}`)
   }
   return response.json()
+}
+
+// ============================================================
+// Embedded Signup (Coexistence) onboarding
+// ============================================================
+//
+// The "Connect with Facebook" popup (Facebook JS SDK + config_id)
+// returns a short-lived authorization `code`. The backend trades it
+// for a long-lived business integration system user access token,
+// then reads the WABA's phone numbers to pick the connected number.
+
+export interface ExchangeCodeForTokenArgs {
+  /** Short-lived authorization code from FB.login (single-use). */
+  code: string
+}
+
+/**
+ * Exchange an Embedded Signup authorization code for a business
+ * integration system user access token.
+ *
+ * Uses the app's own client_id/client_secret (META_APP_ID /
+ * META_APP_SECRET). No `redirect_uri` — the embedded-signup code
+ * exchange does not use one. The returned token is long-lived
+ * (system-user) and is what we store (encrypted) for the account.
+ */
+export async function exchangeCodeForToken(
+  args: ExchangeCodeForTokenArgs
+): Promise<{ accessToken: string }> {
+  const { code } = args
+  const appId = process.env.META_APP_ID
+  const appSecret = process.env.META_APP_SECRET
+  if (!appId || !appSecret) {
+    throw new Error(
+      'Embedded Signup requires META_APP_ID and META_APP_SECRET to be set.'
+    )
+  }
+  const params = new URLSearchParams({
+    client_id: appId,
+    client_secret: appSecret,
+    code,
+  })
+  const url = `${META_API_BASE}/oauth/access_token?${params.toString()}`
+  const response = await fetch(url)
+  if (!response.ok) {
+    await throwMetaError(response, `Token exchange failed: ${response.status}`)
+  }
+  const data = (await response.json()) as { access_token?: string }
+  if (!data.access_token) {
+    throw new Error('Token exchange succeeded but returned no access_token.')
+  }
+  return { accessToken: data.access_token }
+}
+
+export interface WabaPhoneNumber {
+  id: string
+  display_phone_number: string
+  verified_name?: string
+  /** 'VERIFIED' for already-onboarded / coexistence numbers. */
+  code_verification_status?: string
+  quality_rating?: string
+  /** e.g. 'CLOUD_API' | 'SMB_APP' — coexistence numbers report SMB linkage. */
+  platform_type?: string
+}
+
+export interface FetchWabaPhoneNumbersArgs {
+  wabaId: string
+  accessToken: string
+}
+
+/**
+ * List the phone numbers on a WABA. Used right after the token
+ * exchange to resolve the connected number and read its
+ * `code_verification_status` (which decides whether /register is
+ * needed — coexistence numbers come VERIFIED and skip it).
+ */
+export async function fetchWabaPhoneNumbers(
+  args: FetchWabaPhoneNumbersArgs
+): Promise<WabaPhoneNumber[]> {
+  const { wabaId, accessToken } = args
+  const fields =
+    'id,display_phone_number,verified_name,code_verification_status,quality_rating,platform_type'
+  const url = `${META_API_BASE}/${wabaId}/phone_numbers?fields=${fields}`
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  })
+  if (!response.ok) {
+    await throwMetaError(response, `Failed to fetch WABA phone numbers: ${response.status}`)
+  }
+  const data = (await response.json()) as { data?: WabaPhoneNumber[] }
+  return data.data ?? []
 }
 
 // ============================================================
@@ -175,6 +269,58 @@ export async function subscribeWabaToApp(
   })
   if (!response.ok) {
     await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+}
+
+/** Webhook fields a Coexistence connection subscribes to. `messages`
+ *  delivers inbound; `smb_message_echoes` delivers echoes of messages
+ *  the owner sends from the WhatsApp Business app on their phone;
+ *  `history` delivers the up-to-6-month chat history on onboarding. */
+export const COEXISTENCE_SUBSCRIBED_FIELDS = [
+  'messages',
+  'smb_message_echoes',
+  'history',
+] as const
+
+export interface OverrideWabaCallbackArgs {
+  wabaId: string
+  accessToken: string
+  /** Per-tenant callback URL (our webhook). */
+  callbackUrl: string
+  /** Verify token Meta echoes back on the GET handshake. */
+  verifyToken: string
+  /** Defaults to COEXISTENCE_SUBSCRIBED_FIELDS at the call site. */
+  subscribedFields: readonly string[]
+}
+
+/**
+ * Point a specific WABA's webhook at our callback URL (step 3b of
+ * Embedded Signup). This is a second POST to /{waba_id}/subscribed_apps,
+ * this time WITH a body — it overrides the app-level callback for this
+ * one WABA.
+ *
+ * IMPORTANT: the app must already be subscribed to the WABA (a prior
+ * bodyless POST via `subscribeWabaToApp`) or Meta rejects the override.
+ */
+export async function overrideWabaCallback(
+  args: OverrideWabaCallbackArgs
+): Promise<void> {
+  const { wabaId, accessToken, callbackUrl, verifyToken, subscribedFields } = args
+  const url = `${META_API_BASE}/${wabaId}/subscribed_apps`
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      override_callback_uri: callbackUrl,
+      verify_token: verifyToken,
+      subscribed_fields: subscribedFields,
+    }),
+  })
+  if (!response.ok) {
+    await throwMetaError(response, `WABA callback override failed: ${response.status}`)
   }
 }
 

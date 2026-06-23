@@ -49,8 +49,23 @@ interface WhatsAppMessage {
     button_reply?: { id: string; title: string }
     list_reply?: { id: string; title: string; description?: string }
   }
+  /**
+   * Set when the customer taps a quick-reply button on a TEMPLATE message
+   * we sent. This is a DIFFERENT shape from `interactive`: `text` is the
+   * button label, `payload` is the button's configured payload (defaults
+   * to the label). The Flows engine routes on `payload` just like it
+   * routes on `interactive.button_reply.id`.
+   */
+  button?: { text: string; payload: string }
   /** Present when the customer swipe-replies to one of our messages. */
   context?: { id: string }
+  /**
+   * Recipient of an OUTBOUND row — set on `smb_message_echoes` echoes
+   * (owner replied from the phone app) and on outbound history rows.
+   * `from` is the business number in those cases, so the customer is `to`.
+   */
+  to?: string
+  recipient_id?: string
 }
 
 interface WhatsAppWebhookEntry {
@@ -73,10 +88,20 @@ interface WhatsAppWebhookEntry {
         timestamp: string
         recipient_id: string
       }>
+      /**
+       * Coexistence (field 'smb_message_echoes'): echoes of messages the
+       * owner sent from the WhatsApp Business app on their phone. Same
+       * shape as `messages`, but each carries `to`/`recipient_id` (the
+       * customer) since `from` is the business number.
+       */
+      message_echoes?: WhatsAppMessage[]
     }
     field: string
   }>
 }
+
+/** The `value` object of a single webhook change. */
+type WebhookChangeValue = WhatsAppWebhookEntry['changes'][number]['value']
 
 // GET - Webhook verification
 export async function GET(request: Request) {
@@ -205,6 +230,21 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           { field: change.field, value: change.value as unknown },
           supabaseAdmin(),
         )
+        continue
+      }
+
+      // Coexistence: the owner replied from the WhatsApp Business app on
+      // their phone. Meta echoes it here so the CRM mirrors the outbound
+      // message into the conversation.
+      if (change.field === 'smb_message_echoes') {
+        await handleMessageEchoes(change.value)
+        continue
+      }
+
+      // Coexistence onboarding: up-to-6-month chat history delivered as a
+      // batch after the number links.
+      if (change.field === 'history') {
+        await handleHistory(change.value)
         continue
       }
 
@@ -378,6 +418,225 @@ async function handleStatusUpdate(status: {
   }
 }
 
+// The messages.content_type CHECK constraint (widened in migration 010
+// to add 'interactive') allows: text, image, document, audio, video,
+// location, template, interactive. Map any incoming WhatsApp type that
+// isn't in that list to the closest allowed value so the INSERT doesn't
+// trip the constraint. Shared by the inbound, echo, and history paths.
+const ALLOWED_CONTENT_TYPES = new Set([
+  'text', 'image', 'document', 'audio', 'video',
+  'location', 'template', 'interactive',
+])
+function mapContentType(type: string): string {
+  if (ALLOWED_CONTENT_TYPES.has(type)) return type
+  if (type === 'sticker') return 'image' // stickers are images
+  // Template quick-reply button taps are stored as 'interactive' so the
+  // reply id (payload) lands in interactive_reply_id, same as interactive
+  // message button/list replies.
+  if (type === 'button') return 'interactive'
+  return 'text' // reaction, unknown → text fallback
+}
+
+/**
+ * Resolve the single whatsapp_config row for a phone_number_id, with the
+ * same 0-row / multi-row guards the inbound path uses. Returns null (and
+ * logs) when the number maps to zero or multiple accounts.
+ */
+async function resolveConfigByPhoneNumberId(phoneNumberId: string) {
+  const { data: configRows, error } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('*')
+    .eq('phone_number_id', phoneNumberId)
+  if (error) {
+    console.error('Error fetching whatsapp_config for phone_number_id:', phoneNumberId, error)
+    return null
+  }
+  if (!configRows || configRows.length === 0) {
+    console.error('No config found for phone_number_id:', phoneNumberId)
+    return null
+  }
+  if (configRows.length > 1) {
+    console.error(`Multiple configs (${configRows.length}) for phone_number_id:`, phoneNumberId)
+    return null
+  }
+  return configRows[0]
+}
+
+/**
+ * True when a message with this Meta message_id already exists. The
+ * `messages.message_id` index is NOT unique, so dedup must be an explicit
+ * check, not an upsert. Covers two cases for echoes: (a) the CRM already
+ * inserted the row when it sent via /api/whatsapp/send, and (b) Meta
+ * re-delivers the same echo/history event.
+ */
+async function messageAlreadyStored(messageId: string): Promise<boolean> {
+  const { data } = await supabaseAdmin()
+    .from('messages')
+    .select('id')
+    .eq('message_id', messageId)
+    .limit(1)
+    .maybeSingle()
+  return !!data
+}
+
+/**
+ * Coexistence echo handler — mirrors a message the owner sent from the
+ * WhatsApp Business app on their phone into the CRM conversation as an
+ * OUTBOUND (`sender_type='agent'`) message. Does NOT bump unread_count
+ * and does NOT fire flows/automations (it's outbound, not a trigger).
+ */
+async function handleMessageEchoes(value: WebhookChangeValue) {
+  const echoes = value.message_echoes ?? []
+  if (echoes.length === 0) return
+  const config = await resolveConfigByPhoneNumberId(value.metadata.phone_number_id)
+  if (!config) return
+  const accessToken = decrypt(config.access_token)
+  for (const echo of echoes) {
+    await storeOutboundEcho(echo, config, accessToken)
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function storeOutboundEcho(echo: WhatsAppMessage, config: any, accessToken: string) {
+  const customerPhoneRaw = echo.to ?? echo.recipient_id
+  if (!customerPhoneRaw) {
+    console.warn('[webhook] echo missing recipient, skipping:', echo.id)
+    return
+  }
+  if (await messageAlreadyStored(echo.id)) return
+
+  const customerPhone = normalizePhone(customerPhoneRaw)
+  const contactOutcome = await findOrCreateContact(config.account_id, config.user_id, customerPhone, '')
+  if (!contactOutcome) return
+  const conversation = await findOrCreateConversation(config.account_id, config.user_id, contactOutcome.contact.id)
+  if (!conversation) return
+
+  // Reactions aren't standalone messages — skip (same as the inbound path).
+  if (echo.type === 'reaction') return
+
+  const { contentText, mediaUrl, interactiveReplyId } = await parseMessageContent(echo, accessToken)
+  const createdAt = new Date(parseInt(echo.timestamp) * 1000).toISOString()
+
+  const { error } = await supabaseAdmin().from('messages').insert({
+    conversation_id: conversation.id,
+    sender_type: 'agent',
+    content_type: mapContentType(echo.type),
+    content_text: contentText,
+    media_url: mediaUrl,
+    message_id: echo.id,
+    status: 'sent',
+    created_at: createdAt,
+    interactive_reply_id: interactiveReplyId,
+  })
+  if (error) {
+    console.error('[webhook] echo insert failed:', error)
+    return
+  }
+
+  // Surface the owner's phone-sent reply in the inbox preview, but never
+  // bump unread_count (it's outbound).
+  await supabaseAdmin()
+    .from('conversations')
+    .update({
+      last_message_text: contentText || `[${echo.type}]`,
+      last_message_at: createdAt,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', conversation.id)
+}
+
+/**
+ * Coexistence onboarding history import.
+ *
+ * ⚠️ The exact payload shape of the `history` field is not fully
+ * documented (Meta's docs were not machine-readable and Chatwoot does
+ * not subscribe `history`). This handler is defensive: it reads the
+ * standard `messages[]` / `contacts[]` arrays, logs and bails if they're
+ * absent, and must be validated against a real onboarding event before
+ * relying on it. Inserts historical messages with the correct direction
+ * (from === business number → outbound) and does NOT touch the
+ * conversation preview or fire automations.
+ */
+async function handleHistory(value: WebhookChangeValue) {
+  const messages = value.messages ?? []
+  if (messages.length === 0) {
+    console.warn(
+      '[webhook] history event with no messages[] — payload shape may differ, capture a real event to confirm. Snapshot:',
+      JSON.stringify(value).slice(0, 1000),
+    )
+    return
+  }
+  const config = await resolveConfigByPhoneNumberId(value.metadata.phone_number_id)
+  if (!config) return
+  const accessToken = decrypt(config.access_token)
+  const businessNumber = normalizePhone(value.metadata.display_phone_number || '')
+
+  const nameByPhone = new Map<string, string>()
+  for (const c of value.contacts ?? []) {
+    if (c.wa_id) nameByPhone.set(normalizePhone(c.wa_id), c.profile?.name ?? '')
+  }
+
+  // Insert oldest-first so threads read naturally.
+  const ordered = [...messages].sort(
+    (a, b) => parseInt(a.timestamp) - parseInt(b.timestamp),
+  )
+  for (const msg of ordered) {
+    await storeHistoricalMessage(msg, config, accessToken, businessNumber, nameByPhone)
+  }
+}
+
+async function storeHistoricalMessage(
+  msg: WhatsAppMessage,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  config: any,
+  accessToken: string,
+  businessNumber: string,
+  nameByPhone: Map<string, string>,
+) {
+  const fromNorm = normalizePhone(msg.from || '')
+  const isOutbound = businessNumber.length > 0 && fromNorm === businessNumber
+  const counterpartRaw = isOutbound ? (msg.to ?? msg.recipient_id) : msg.from
+  if (!counterpartRaw) return
+  if (msg.type === 'reaction') return
+  if (await messageAlreadyStored(msg.id)) return
+
+  const counterpart = normalizePhone(counterpartRaw)
+  const contactOutcome = await findOrCreateContact(
+    config.account_id,
+    config.user_id,
+    counterpart,
+    nameByPhone.get(counterpart) ?? '',
+  )
+  if (!contactOutcome) return
+  const conversation = await findOrCreateConversation(
+    config.account_id,
+    config.user_id,
+    contactOutcome.contact.id,
+  )
+  if (!conversation) return
+
+  const { contentText, mediaUrl, interactiveReplyId } = await parseMessageContent(msg, accessToken)
+  const createdAt = new Date(parseInt(msg.timestamp) * 1000).toISOString()
+
+  const { error } = await supabaseAdmin().from('messages').insert({
+    conversation_id: conversation.id,
+    sender_type: isOutbound ? 'agent' : 'customer',
+    content_type: mapContentType(msg.type),
+    content_text: contentText,
+    media_url: mediaUrl,
+    message_id: msg.id,
+    status: isOutbound ? 'sent' : 'delivered',
+    created_at: createdAt,
+    interactive_reply_id: interactiveReplyId,
+  })
+  if (error) {
+    console.error('[webhook] history insert failed:', error)
+  }
+  // Intentionally NOT updating conversation last_message_* — historical
+  // rows must not regress the inbox sort below a newer live message. The
+  // thread still renders these in order (by created_at) when opened.
+}
+
 /**
  * If an inbound message's sender is on a still-unreplied
  * broadcast_recipients row, flip it to `replied` so the reply count
@@ -512,7 +771,11 @@ async function processMessage(
   accessToken: string
 ) {
   const senderPhone = normalizePhone(message.from)
-  const contactName = contact.profile.name
+  // Meta omits `profile` on some inbound payloads (sender hasn't shared a
+  // WhatsApp profile name, certain number types). Guard so we don't crash
+  // and silently drop the message — findOrCreateContact falls back to the
+  // phone number when the name is empty.
+  const contactName = contact.profile?.name ?? ''
 
   // Find or create contact
   const contactOutcome = await findOrCreateContact(
@@ -569,20 +832,7 @@ async function processMessage(
   // parseMessageContent. Silence the unused-var warning:
   void mediaType
 
-  // The messages.content_type CHECK constraint (widened in migration 010
-  // to add 'interactive' for button/list taps) allows:
-  //   text, image, document, audio, video, location, template, interactive
-  // Map incoming WhatsApp types that aren't in that list to the closest
-  // allowed value so the INSERT doesn't fail with a constraint error.
-  const ALLOWED_CONTENT_TYPES = new Set([
-    'text', 'image', 'document', 'audio', 'video',
-    'location', 'template', 'interactive',
-  ])
-  const contentType = ALLOWED_CONTENT_TYPES.has(message.type)
-    ? message.type
-    : message.type === 'sticker'
-      ? 'image'   // stickers are images
-      : 'text'    // reaction, unknown → text fallback
+  const contentType = mapContentType(message.type)
 
   // Determine whether this is the contact's very first inbound message
   // BEFORE we insert, so the count is accurate. Covers the case where
@@ -850,6 +1100,17 @@ async function parseMessageContent(
         }
       }
       return { ...empty, contentText: '[Interactive reply]' }
+    }
+
+    case 'button': {
+      // Customer tapped a quick-reply button on a template we sent. Surface
+      // the visible label as contentText and route on the payload like an
+      // interactive reply (Flows engine consumes interactiveReplyId).
+      return {
+        ...empty,
+        contentText: message.button?.text || message.button?.payload || null,
+        interactiveReplyId: message.button?.payload ?? null,
+      }
     }
 
     default:
