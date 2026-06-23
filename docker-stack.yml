@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  wacrm:
+    image: wacrm:latest
+    environment:
+      - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - META_APP_ID=${META_APP_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+      - META_CONFIG_ID=${META_CONFIG_ID}
+      - META_API_VERSION=${META_API_VERSION}
+      - NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL}
+      - AUTOMATION_CRON_SECRET=${AUTOMATION_CRON_SECRET}
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.wacrm.rule=Host(`wacrm.gestorlead.com.br`)
+        - traefik.http.routers.wacrm.entrypoints=websecure
+        - traefik.http.routers.wacrm.tls.certresolver=letsencrypt
+        - traefik.http.services.wacrm.loadbalancer.server.port=3000
+        # - traefik.http.routers.wacrm.middlewares=secure-headers@file
+    networks:
+      - network_public
+
+networks:
+  network_public:
+    external: true
+    name: network_public

@@ -15,6 +15,10 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { createClient } from '@/lib/supabase/client';
+import {
+  runEmbeddedSignup,
+  isEmbeddedSignupConfigured,
+} from '@/lib/whatsapp/embedded-signup-client';
 import { useAuth } from '@/hooks/use-auth';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -46,6 +50,7 @@ export function WhatsAppConfig() {
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const [testing, setTesting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [showToken, setShowToken] = useState(false);
@@ -359,6 +364,38 @@ export function WhatsAppConfig() {
     toast.success('Webhook URL copied to clipboard');
   }
 
+  const embeddedSignupAvailable = isEmbeddedSignupConfigured();
+
+  // "Connect with Facebook" — runs Meta's Embedded Signup popup, then
+  // hands the credentials to the backend which exchanges the code,
+  // subscribes the webhook, and saves the (encrypted) config. One flow
+  // serves both a Cloud number and a Coexistence (phone-app) number.
+  async function handleEmbeddedSignup() {
+    setConnecting(true);
+    try {
+      const result = await runEmbeddedSignup();
+      if (!result) return; // user cancelled the popup
+      const res = await fetch('/api/whatsapp/embedded-signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(result),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast.error(data.error || 'Failed to connect WhatsApp');
+        return;
+      }
+      toast.success(
+        `WhatsApp connected${data.display_phone_number ? `: ${data.display_phone_number}` : ''}`,
+      );
+      if (accountId) await fetchConfig(accountId);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to connect WhatsApp');
+    } finally {
+      setConnecting(false);
+    }
+  }
+
   if (loading) {
     return (
       <section className="animate-in fade-in-50 duration-200">
@@ -384,6 +421,57 @@ export function WhatsAppConfig() {
       <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
       {/* Main config form */}
       <div className="space-y-6">
+        {/* Embedded Signup — primary connection path */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Zap className="size-4 text-primary" />
+              Connect with Facebook
+            </CardTitle>
+            <CardDescription>
+              Connect the WhatsApp Business number you already use on your
+              phone. It keeps working in the app and starts handling messages
+              through wacrm too (Coexistence) — no tokens or technical setup.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <Button
+              onClick={handleEmbeddedSignup}
+              disabled={connecting || !embeddedSignupAvailable}
+            >
+              {connecting ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Connecting…
+                </>
+              ) : (
+                'Connect with Facebook'
+              )}
+            </Button>
+            {!embeddedSignupAvailable && (
+              <p className="text-sm text-muted-foreground">
+                Ask your administrator to set{' '}
+                <code>NEXT_PUBLIC_META_APP_ID</code> and{' '}
+                <code>NEXT_PUBLIC_META_CONFIG_ID</code> to enable this option.
+              </p>
+            )}
+            <p className="text-sm text-muted-foreground">
+              After confirming the number, scan the QR code in the app:{' '}
+              <strong>Settings → Linked devices → Link a device</strong>.
+            </p>
+          </CardContent>
+        </Card>
+
+        {/* Divider into the legacy manual flow */}
+        <div className="pt-1">
+          <h3 className="text-sm font-medium text-foreground">
+            Manual configuration (advanced)
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            Already have Cloud API credentials? Enter them manually below.
+          </p>
+        </div>
+
         {/* Corrupted-token reset banner */}
         {showResetBanner && (
           <Alert className="bg-amber-950/40 border-amber-600/40">

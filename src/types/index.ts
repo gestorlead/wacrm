@@ -224,6 +224,14 @@ export interface WhatsAppConfig {
   subscribed_apps_at?: string;
   /** Last error from /register; cleared on success. */
   last_registration_error?: string;
+  /** How this number was connected. Defaults to 'manual' for rows that
+   *  predate Embedded Signup. */
+  connection_type?: 'manual' | 'embedded_signup';
+  /** Meta business_id captured during Embedded Signup. */
+  meta_business_id?: string;
+  /** True when the number runs in Coexistence (still active in the
+   *  WhatsApp Business app on the owner's phone). */
+  is_coexistence?: boolean;
 }
 
 // Raw Meta status enum. We persist this verbatim from Meta (sync + webhook)
