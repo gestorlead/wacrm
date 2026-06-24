@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { decrypt } from '@/lib/whatsapp/encryption'
+import { getInboxChannel } from '@/lib/channels/config-resolver'
 import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize'
 import type { TemplateButton, TemplateSampleValues } from '@/types'
 
@@ -122,7 +123,7 @@ function extractSampleValues(
   return sv
 }
 
-export async function POST() {
+export async function POST(request: Request) {
   try {
     const supabase = await createClient()
 
@@ -135,8 +136,8 @@ export async function POST() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Resolve the caller's account_id — both whatsapp_config and
-    // the message_templates we sync into are account-scoped.
+    // Resolve the caller's account_id — message_templates carries it for
+    // the admin write check; the templates themselves are inbox-scoped.
     const { data: profile } = await supabase
       .from('profiles')
       .select('account_id')
@@ -150,17 +151,20 @@ export async function POST() {
       )
     }
 
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
+    // Templates are per-WABA — sync targets one inbox's channel.
+    const body = await request.json().catch(() => ({}))
+    const inboxId = body?.inbox_id as string | undefined
+    if (!inboxId) {
+      return NextResponse.json({ error: 'inbox_id is required' }, { status: 400 })
+    }
+    const channel = await getInboxChannel(supabase, inboxId)
+    const config = channel?.config ?? null
 
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         {
           error:
-            'WhatsApp not configured. Connect your WhatsApp Business account in Settings first.',
+            'WhatsApp not configured for this inbox. Connect the channel first.',
         },
         { status: 400 },
       )
@@ -235,8 +239,9 @@ export async function POST() {
       const row = {
         // Account tenancy + user audit, same split as the submit
         // route. account_id is NOT NULL on message_templates
-        // post-017, so an INSERT without it errors.
+        // post-017; inbox_id (033) scopes the template to this WABA.
         account_id: accountId,
+        inbox_id: inboxId,
         user_id: user.id,
         name: t.name,
         category: normalizeCategory(t.category),
@@ -257,7 +262,7 @@ export async function POST() {
       const { data: existing, error: lookupErr } = await supabase
         .from('message_templates')
         .select('id')
-        .eq('account_id', accountId)
+        .eq('inbox_id', inboxId)
         .eq('name', t.name)
         .eq('language', t.language)
         .maybeSingle()

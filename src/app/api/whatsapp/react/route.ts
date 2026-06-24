@@ -8,6 +8,7 @@ import {
   rateLimitResponse,
   RATE_LIMITS,
 } from '@/lib/rate-limit';
+import { getChannelForConversation } from '@/lib/channels/config-resolver';
 
 /**
  * POST /api/whatsapp/react
@@ -108,19 +109,16 @@ export async function POST(request: Request) {
       );
     }
 
-    // WhatsApp config + access token. Account-scoped post-multi-user.
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('phone_number_id, access_token')
-      .eq('account_id', accountId)
-      .single();
-
-    if (configError || !config) {
+    // WhatsApp config from the conversation's inbox (multi-inbox): react
+    // through the same number that owns the thread.
+    const channel = await getChannelForConversation(supabase, conversation.id);
+    if (!channel) {
       return NextResponse.json(
-        { error: 'WhatsApp not configured.' },
+        { error: 'WhatsApp not configured for this inbox.' },
         { status: 400 },
       );
     }
+    const config = channel.config;
 
     const accessToken = decrypt(config.access_token);
     const sanitizedPhone = sanitizePhoneForMeta(contact.phone);

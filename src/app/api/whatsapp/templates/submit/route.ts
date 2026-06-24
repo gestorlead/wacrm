@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { createClient } from '@/lib/supabase/server'
 import { decrypt } from '@/lib/whatsapp/encryption'
+import { getInboxChannel } from '@/lib/channels/config-resolver'
 import { submitMessageTemplate } from '@/lib/whatsapp/meta-api'
 import {
   validateTemplatePayload,
@@ -18,6 +19,7 @@ import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize'
  */
 function buildUpsertRow(
   accountId: string,
+  inboxId: string,
   userId: string,
   payload: TemplatePayload,
   extras: {
@@ -31,9 +33,10 @@ function buildUpsertRow(
     // of migration 017. Without this an INSERT throws on the
     // not-null constraint.
     account_id: accountId,
-    // Original author — kept as audit only. The unique index is
-    // still on (user_id, name, language) — see the upsert helper
-    // for the cross-teammate dedup follow-up.
+    // WABA scope (033): templates belong to the inbox they were
+    // submitted under; the unique key is (inbox_id, name, language).
+    inbox_id: inboxId,
+    // Original author — audit only.
     user_id: userId,
     name: payload.name,
     category: payload.category,
@@ -60,14 +63,10 @@ async function upsertTemplateRow(
   supabase: SupabaseClient,
   row: ReturnType<typeof buildUpsertRow>,
 ) {
-  // TODO(account-sharing): conflict target is still scoped to
-  // user_id. Once a follow-up migration drops the legacy unique
-  // index on (user_id, name, language) and adds (account_id,
-  // name, language), switch `onConflict` here so two teammates
-  // can't shadow each other's same-named template.
+  // Per-WABA uniqueness (033): one row per (inbox, name, language).
   return supabase
     .from('message_templates')
-    .upsert(row, { onConflict: 'user_id,name,language' })
+    .upsert(row, { onConflict: 'inbox_id,name,language' })
     .select()
     .single()
 }
@@ -119,6 +118,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 })
     }
 
+    // Templates are per-WABA — the caller must say which inbox.
+    const inboxId = (payload as unknown as { inbox_id?: string }).inbox_id
+    if (!inboxId) {
+      return NextResponse.json({ error: 'inbox_id is required' }, { status: 400 })
+    }
+
     if (payload.category === 'Authentication') {
       return NextResponse.json(
         {
@@ -149,16 +154,13 @@ export async function POST(request: Request) {
       metaTemplateId = `dry-run-${crypto.randomUUID()}`
       metaStatus = 'PENDING'
     } else {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config) {
+      const channel = await getInboxChannel(supabase, inboxId)
+      const config = channel?.config ?? null
+      if (!config) {
         return NextResponse.json(
           {
             error:
-              'WhatsApp not configured. Connect your WhatsApp Business account in Settings first.',
+              'WhatsApp not configured for this inbox. Connect the channel first.',
           },
           { status: 400 },
         )
@@ -203,7 +205,7 @@ export async function POST(request: Request) {
         // until they fix and re-submit.
         await upsertTemplateRow(
           supabase,
-          buildUpsertRow(accountId, user.id, payload, {
+          buildUpsertRow(accountId, inboxId, user.id, payload, {
             status: 'DRAFT',
             metaTemplateId: null,
             submissionError: message,
@@ -223,7 +225,7 @@ export async function POST(request: Request) {
 
     const { data: row, error: upsertErr } = await upsertTemplateRow(
       supabase,
-      buildUpsertRow(accountId, user.id, payload, {
+      buildUpsertRow(accountId, inboxId, user.id, payload, {
         status: normalizeStatus(metaStatus),
         metaTemplateId,
         submissionError: null,

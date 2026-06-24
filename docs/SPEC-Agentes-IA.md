@@ -1,6 +1,8 @@
 # SPEC: wacrm — Agentes de IA
 
-> Feature independente. O onboarding do WhatsApp é tratado em `SPEC-WhatsApp-Onboarding.md` e não deve bloquear esta feature — os agentes funcionam sobre qualquer conexão WhatsApp já existente (e via chat de teste, sem WhatsApp).
+> Feature independente. O onboarding do WhatsApp é tratado em `SPEC-WhatsApp-Onboarding.md` e não deve bloquear esta feature — os agentes funcionam sobre qualquer **inbox** já conectado (e via chat de teste, sem WhatsApp).
+
+> ⚠️ **Atualizado para multi-inbox.** O wacrm já implementou multi-inbox (migrations 032/033): uma conta tem N **inboxes** (cada um = um número/WABA), conversas pertencem a um inbox (`conversations.inbox_id` + `contact_inbox_id`), humanos são ligados a inboxes via `inbox_members`, e o envio/templates resolvem a config pela WABA do inbox da conversa. Esta spec reflete isso: **um agente de IA é vinculado a um inbox** (paralelo ao `inbox_members` dos humanos e ao `agent_bot_inboxes` do Chatwoot). Veja a seção "Compatibilidade Multi-inbox".
 
 ## Visão Geral
 
@@ -15,8 +17,9 @@ O motor de IA é enxuto — sem channels múltiplos, sem plugin system, sem suba
 1. **Zero código** — usuário configura tudo por UI (sliders, toggles, textareas com placeholders explicativos)
 2. **Templates primeiro** — usuário começa de um template (Vendas, Suporte, Agendamento) e customiza
 3. **Transparência de custo** — dashboard mostra tokens consumidos e custo estimado em tempo real
-4. **Escala humana** — agente sabe quando transferir pra humano (regras + IA)
+4. **Escala humana** — agente sabe quando transferir pra humano (regras + IA), escolhendo entre os `inbox_members` do inbox da conversa
 5. **Multi-tenant nativo** — cada account tem seus próprios agentes, isolados por RLS
+6. **Vinculado ao inbox** — cada agente atende um inbox específico (um número/WABA). O runtime, o envio e os templates seguem a config daquele inbox; a visibilidade segue `can_access_inbox`
 
 ---
 
@@ -62,6 +65,11 @@ wacrm (Next.js + Supabase)
 CREATE TABLE agents (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  -- Inbox (número/WABA) que este agente atende. O webhook só dispara o
+  -- agente cujo inbox_id == conversation.inbox_id. NOT NULL: um agente
+  -- atende um inbox. Mesma persona em 2 números = 2 agentes (ou ver a
+  -- alternativa de join na seção "Compatibilidade Multi-inbox").
+  inbox_id UUID NOT NULL REFERENCES inboxes(id) ON DELETE CASCADE,
   name TEXT NOT NULL,                    -- "Ana - Vendas"
   description TEXT,                      -- "Atende leads do WhatsApp"
   
@@ -83,7 +91,9 @@ CREATE TABLE agents (
   
   -- Escalada
   auto_transfer_keywords TEXT[],         -- ["humano", "falar com atendente"]
-  transfer_to UUID,                      -- member_id pra transferir
+  transfer_to UUID,                      -- user_id de um inbox_member do inbox
+                                         -- deste agente; NULL = round-robin
+                                         -- entre os membros do inbox
   
   -- Ferramentas (quais tools o agente pode usar)
   enabled_tools TEXT[] DEFAULT '{search_contact,create_deal,send_message}',
@@ -98,6 +108,18 @@ CREATE TABLE agents (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Um único agente ATIVO por inbox, para o webhook escolher de forma
+-- determinística. (Vários agentes podem coexistir inativos no mesmo inbox.)
+CREATE UNIQUE INDEX idx_one_active_agent_per_inbox
+  ON agents (inbox_id) WHERE is_active;
+
+CREATE INDEX idx_agents_inbox ON agents (inbox_id);
+
+-- RLS: membros que acessam o inbox enxergam o agente; admins gerenciam.
+-- Espelha a política de message_templates (033).
+--   SELECT  USING (can_access_inbox(inbox_id))
+--   INSERT/UPDATE/DELETE  USING (is_account_member(account_id, 'admin'))
 ```
 
 ### `agent_documents` (Base de Conhecimento / RAG)
@@ -246,6 +268,11 @@ Escala: "cancelar agendamento", "falar com responsável"
 ```
 ┌─────────────────────────────────────────────────┐
 │  Identidade do Agente                            │
+│                                                  │
+│  Inbox (número que este agente atende): *        │
+│  [📱 WhatsApp Vendas (+55 11 9...) ▾]            │
+│   ⚠ Só 1 agente ativo por inbox. Se já houver,   │
+│     o novo entra inativo até você trocar.        │
 │                                                  │
 │  Nome: [Ana - Vendas_____________________]      │
 │  Descrição: [Atende leads do WhatsApp___]       │
@@ -584,10 +611,22 @@ Adiciona uma anotação ao contato.
 Busca na base de conhecimento do agente (RAG via pgvector).
 
 ### `transfer_to_human`
-Transfere a conversa para um atendente humano. Encerra a atuação do agente.
+Transfere a conversa para um atendente humano e encerra a atuação do agente. O
+destino é escolhido entre os `inbox_members` do **inbox da conversa** (`transfer_to`
+fixo, ou round-robin entre os membros do inbox).
 
 ### `schedule_message`
-Agenda uma mensagem de follow-up (ex: "enviar lembrete amanhã às 10h").
+Agenda uma mensagem de follow-up (ex: "enviar lembrete amanhã às 10h"). Enviada
+pela config do inbox da conversa.
+
+### `send_template`
+Envia um template aprovado (ex.: reengajamento fora da janela de 24h). Resolve o
+template em `message_templates` escopado ao `inbox_id` da conversa (033) e envia
+pela WABA daquele inbox.
+
+> Todas as tools de saída (`send_message`, `send_template`, `schedule_message`)
+> usam `getChannelForConversation` — o agente nunca escolhe o número, herda o da
+> conversa.
 
 ---
 
@@ -611,24 +650,72 @@ O admin do wacrm configura as API keys globalmente. O usuário só escolhe "Econ
 ## Fluxo de Integração com WhatsApp
 
 ```
-Mensagem chega no WhatsApp
+Mensagem chega no WhatsApp (em UM dos inboxes da conta)
   ↓
 Meta Webhook → wacrm /api/whatsapp/webhook (JÁ EXISTE)
   ↓
-Salva mensagem no banco (JÁ EXISTE)
+resolveWhatsAppInboxByPhoneNumberId → inbox_id da conversa (JÁ EXISTE, 032)
   ↓
-Verifica se a conversa tem agente ativo (NOVO)
+Salva mensagem na conversa do inbox (JÁ EXISTE)
   ↓
-Se sim → POST /api/agent (NOVO)
+Busca o agente ATIVO do inbox da conversa (NOVO)
+  agents WHERE inbox_id = conversation.inbox_id AND is_active
   ↓
-engine.ts processa
+Se houver → POST /api/agent { conversationId } (NOVO)
   ↓
-Resposta enviada via WhatsApp API (JÁ EXISTE)
+engine.ts processa (resolve persona/tools do agente do inbox)
+  ↓
+Resposta enviada pela config DAQUELE inbox via getChannelForConversation (JÁ EXISTE)
   ↓
 Stats registradas (NOVO)
 ```
 
-O webhook existente do wacrm já recebe mensagens. Só precisamos adicionar um **hook** depois de salvar a mensagem inbound: se a conversa tem um agente ativo atribuído, chamar o engine.
+O webhook existente já resolve o `inbox_id` da conversa (multi-inbox). Só precisamos adicionar um **hook** depois de salvar a mensagem inbound: buscar o agente ativo **daquele inbox** (`agents.inbox_id = conversation.inbox_id AND is_active`) e, se existir, chamar o engine. O envio do agente reusa `getChannelForConversation` (em `@/lib/channels/config-resolver`), então a resposta sai sempre pelo número correto — nunca por "o número da conta".
+
+> ⚠️ Não dispare o agente em `smb_message_echoes` (mensagens que o dono enviou pelo app do celular, na Coexistence) — isso é saída do humano, não um gatilho de entrada. Mesma regra que flows/automations já seguem.
+
+---
+
+## Compatibilidade Multi-inbox
+
+O wacrm já é multi-inbox (migrations 032/033). Implicações para os agentes:
+
+**1. Vínculo agente → inbox.** `agents.inbox_id` (NOT NULL). O agente atua apenas
+nas conversas do seu inbox. Índice único `(inbox_id) WHERE is_active` garante **um
+agente ativo por inbox** — o webhook escolhe sem ambiguidade.
+- *Alternativa (se quiser uma persona em vários números):* trocar `agents.inbox_id`
+  por uma join `agent_inboxes(agent_id, inbox_id)` — paralela a `inbox_members`
+  (humanos) e ao `agent_bot_inboxes` do Chatwoot. Nesse caso, a regra "1 ativo por
+  inbox" passa a ser validada na junção. A spec adota o vínculo direto (lean); a
+  join é a evolução natural quando houver demanda.
+
+**2. Roteamento de entrada.** O webhook (que já resolve `conversation.inbox_id`)
+seleciona `agents WHERE inbox_id = conversation.inbox_id AND is_active`. Sem agente
+no inbox → comportamento atual (humano/flows/automations).
+
+**3. Envio sempre pelo inbox da conversa.** Toda saída do agente
+(`send_message`, `send_template`, follow-ups) usa `getChannelForConversation(db,
+conversationId)` — o mesmo resolver que send/flows/automations já usam. O agente
+nunca escolhe número; ele herda o da conversa.
+
+**4. Templates por-WABA.** Se o agente disparar template (ex.: reengajamento fora
+da janela de 24h), ele resolve em `message_templates` escopado por
+`inbox_id = conversation.inbox_id` (033). Um template aprovado em outra WABA não é
+elegível.
+
+**5. Transferência para humano.** O pool de destino são os `inbox_members` do
+inbox da conversa (não toda a conta). `transfer_to` = um `user_id` membro daquele
+inbox; se NULL, round-robin entre os membros do inbox. Isso reaproveita o conceito
+de membros por inbox.
+
+**6. RLS.** `agents` (e `agent_documents`) seguem o padrão de `message_templates`:
+SELECT por `can_access_inbox(inbox_id)` (membros do inbox veem/“testam” o agente),
+escrita por `is_account_member(account_id, 'admin')`. O engine roda via service-role
+(ignora RLS), derivando `account_id`/`inbox_id` do agente resolvido.
+
+**7. Stats.** `agent_id` já implica o inbox (agente é por-inbox), então
+`agent_usage_daily(account, agent, date)` segmenta por inbox naturalmente — relatórios
+"por número" saem de um join `agents.inbox_id`. Sem coluna extra necessária.
 
 ---
 
@@ -656,19 +743,20 @@ Quando o agente atinge um limite:
 > O onboarding do WhatsApp é uma feature separada (ver `SPEC-WhatsApp-Onboarding.md`) e não bloqueia estes sprints — o chat de teste permite validar agentes sem WhatsApp.
 
 ### Sprint 1 — Fundação IA (1-2 semanas)
-- [ ] Criar tabelas (agents, agent_documents, agent_conversation_stats, agent_usage_daily)
+- [ ] Criar tabelas (agents **com `inbox_id` NOT NULL** + índice único de 1 ativo/inbox, agent_documents, agent_conversation_stats, agent_usage_daily)
+- [ ] RLS dos agentes seguindo `message_templates` (SELECT `can_access_inbox`, escrita admin)
 - [ ] Habilitar pgvector no Supabase
 - [ ] `/lib/agent/models.ts` — config de modelos e preços
-- [ ] `/lib/agent/engine.ts` — core do motor (sem tools ainda, só chat)
+- [ ] `/lib/agent/engine.ts` — core do motor (sem tools ainda, só chat); saída via `getChannelForConversation`
 - [ ] `/lib/agent/context.ts` — histórico + compaction
-- [ ] Hook no webhook: chamar engine quando agente ativo
+- [ ] Hook no webhook: resolver agente ativo por `conversation.inbox_id` e chamar o engine (ignorar `smb_message_echoes`)
 
 ### Sprint 2 — UI (1-2 semanas)
-- [ ] `/agents` — lista com cards e stats
-- [ ] `/agents/new` — wizard de criação (6 steps)
+- [ ] `/agents` — lista com cards e stats (mostrar o inbox de cada agente)
+- [ ] `/agents/new` — wizard de criação (6 steps; **seleção de inbox** no passo de Identidade)
 - [ ] `/agents/[id]` — dashboard com gráficos
 - [ ] Templates pré-configurados (4)
-- [ ] Chat de teste (testar sem WhatsApp)
+- [ ] Chat de teste (testar sem WhatsApp; usa o inbox do agente para `send_template`)
 
 ### Sprint 3 — Tools e RAG (1-2 semanas)
 - [ ] Implementar tools (search_contact, create_deal, add_tag, etc)
@@ -695,4 +783,4 @@ Quando o agente atinge um limite:
 - **pgvector**: já suportado pelo Supabase Cloud, só habilitar a extensão
 - **Rate limit handling**: engine faz retry com backoff exponencial antes de cair pro fallback
 - **Observabilidade**: cada chamada registra model, tokens, custo e latência — transparente pra tenants e admin
-- **Multi-tenant**: todas as tabelas têm `account_id` + RLS
+- **Multi-tenant + multi-inbox**: todas as tabelas têm `account_id` + RLS; `agents` carrega `inbox_id` e a visibilidade segue `can_access_inbox`. Entrada, saída e templates do agente são sempre resolvidos pelo inbox da conversa (`getChannelForConversation`)

@@ -48,13 +48,19 @@ export async function GET(
       )
     }
 
-    // Fetch and decrypt WhatsApp config
-    const { data: config, error: configError } = await supabase
+    // Best-effort media proxy fallback (most media is persisted to the
+    // chat-media bucket at ingest). The stored proxy URL carries only the
+    // mediaId, no inbox context, so with multi-inbox we use any of the
+    // account's connected numbers' tokens — media tokens are valid across
+    // the business's numbers. `.limit(1)` avoids the `.single()` throw an
+    // account with several configs would now trigger.
+    const { data: configs, error: configError } = await supabase
       .from('whatsapp_config')
       .select('*')
       .eq('account_id', accountId)
-      .single()
+      .limit(1)
 
+    const config = configs?.[0]
     if (configError || !config) {
       return NextResponse.json(
         { error: 'WhatsApp not configured' },

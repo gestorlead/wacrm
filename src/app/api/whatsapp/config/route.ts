@@ -60,7 +60,7 @@ function supabaseAdmin() {
  *   { connected: false, reason: 'token_corrupted',  message: '...', needs_reset: true }
  *   { connected: false, reason: 'meta_api_error',   message: '...' }
  */
-export async function GET() {
+export async function GET(request: Request) {
   try {
     const supabase = await createClient()
 
@@ -85,11 +85,16 @@ export async function GET() {
       )
     }
 
-    const { data: config, error: configError } = await supabase
+    // Multi-inbox: target a specific inbox via `?inbox_id`, else the
+    // account's primary (earliest) number for backward compatibility.
+    const inboxId = new URL(request.url).searchParams.get('inbox_id')
+    const baseQuery = supabase
       .from('whatsapp_config')
-      .select('phone_number_id, access_token, status')
-      .eq('account_id', accountId)
-      .maybeSingle()
+      .select('phone_number_id, waba_id, access_token, status, connection_type, registered_at')
+    const { data: configRows, error: configError } = inboxId
+      ? await baseQuery.eq('inbox_id', inboxId).limit(1)
+      : await baseQuery.eq('account_id', accountId).order('created_at', { ascending: true }).limit(1)
+    const config = configRows?.[0]
 
     if (configError) {
       console.error('Error fetching whatsapp_config:', configError)
@@ -135,7 +140,14 @@ export async function GET() {
         phoneNumberId: config.phone_number_id,
         accessToken,
       })
-      return NextResponse.json({ connected: true, phone_info: phoneInfo })
+      return NextResponse.json({
+        connected: true,
+        phone_info: phoneInfo,
+        phone_number_id: config.phone_number_id,
+        waba_id: config.waba_id,
+        connection_type: config.connection_type,
+        registered: !!config.registered_at,
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown Meta API error'
       console.error('[whatsapp/config GET] Meta API verification failed:', message)
@@ -185,7 +197,7 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json()
-    const { phone_number_id, waba_id, access_token, verify_token, pin } = body
+    const { phone_number_id, waba_id, access_token, verify_token, pin, inbox_id } = body
 
     if (!access_token || !phone_number_id) {
       return NextResponse.json(
@@ -269,14 +281,17 @@ export async function POST(request: Request) {
       )
     }
 
-    // Look up any pre-existing row for this account so we know whether
-    // this number is already registered with Meta — if so we can skip
-    // /register when the user didn't provide a PIN this time around.
-    const { data: existing } = await supabase
+    // Look up any pre-existing row so we know whether this number is
+    // already registered with Meta — if so we can skip /register when the
+    // user didn't provide a PIN this time around. Multi-inbox: scope by
+    // `inbox_id` when provided, else the account's primary (single) number.
+    const existingQuery = supabase
       .from('whatsapp_config')
-      .select('id, registered_at, phone_number_id')
-      .eq('account_id', accountId)
-      .maybeSingle()
+      .select('id, inbox_id, registered_at, phone_number_id')
+    const { data: existingRows } = inbox_id
+      ? await existingQuery.eq('inbox_id', inbox_id).limit(1)
+      : await existingQuery.eq('account_id', accountId).order('created_at', { ascending: true }).limit(1)
+    const existing = existingRows?.[0] ?? null
 
     const sameNumber =
       existing?.phone_number_id === phone_number_id &&
@@ -367,10 +382,12 @@ export async function POST(request: Request) {
     }
 
     if (existing) {
+      // Update the precise row (by id) rather than by account_id — an
+      // account can now have several configs.
       const { error: updateError } = await supabase
         .from('whatsapp_config')
         .update(baseRow)
-        .eq('account_id', accountId)
+        .eq('id', existing.id)
 
       if (updateError) {
         console.error('Error updating whatsapp_config:', updateError)
@@ -380,15 +397,34 @@ export async function POST(request: Request) {
         )
       }
     } else {
-      // Insert with both columns: `account_id` is the tenancy key
-      // (NOT NULL post-017, UNIQUE so duplicates trip the constraint
-      // up-front), `user_id` is the audit column identifying which
-      // member of the account saved the config.
+      // No config yet for the target. Resolve the inbox to attach to:
+      // the explicit `inbox_id`, or create one (legacy first-connect, when
+      // the account had no inbox). The config's inbox_id is NOT NULL.
+      let targetInboxId: string | null = inbox_id ?? null
+      if (!targetInboxId) {
+        const { data: inbox, error: inboxErr } = await supabase
+          .from('inboxes')
+          .insert({
+            account_id: accountId,
+            name: 'WhatsApp' + (phoneInfo?.display_phone_number ? ` ${phoneInfo.display_phone_number}` : ''),
+            channel_type: 'whatsapp',
+          })
+          .select('id')
+          .single()
+        if (inboxErr || !inbox) {
+          console.error('Error creating inbox for config:', inboxErr)
+          return NextResponse.json({ error: 'Failed to create inbox' }, { status: 500 })
+        }
+        targetInboxId = inbox.id
+        await supabase.from('inbox_members').insert({ inbox_id: targetInboxId, user_id: user.id })
+      }
+
       const { error: insertError } = await supabase
         .from('whatsapp_config')
         .insert({
           account_id: accountId,
           user_id: user.id,
+          inbox_id: targetInboxId,
           ...baseRow,
         })
 
@@ -438,7 +474,7 @@ export async function POST(request: Request) {
  * Used by the "Reset Configuration" button to recover from a corrupted
  * encrypted token (mismatched ENCRYPTION_KEY across environments).
  */
-export async function DELETE() {
+export async function DELETE(request: Request) {
   try {
     const supabase = await createClient()
 
@@ -459,10 +495,13 @@ export async function DELETE() {
       )
     }
 
-    const { error: deleteError } = await supabase
-      .from('whatsapp_config')
-      .delete()
-      .eq('account_id', accountId)
+    // Multi-inbox: reset a specific inbox's config via `?inbox_id`, else
+    // the account's primary number (legacy single-inbox behaviour).
+    const inboxId = new URL(request.url).searchParams.get('inbox_id')
+    const delQuery = supabase.from('whatsapp_config').delete()
+    const { error: deleteError } = inboxId
+      ? await delQuery.eq('inbox_id', inboxId)
+      : await delQuery.eq('account_id', accountId)
 
     if (deleteError) {
       console.error('Error deleting whatsapp_config:', deleteError)

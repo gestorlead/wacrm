@@ -357,6 +357,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         .insert({
           user_id: user.id,
           account_id: accountId,
+          // The template's WABA is the sending number (033).
+          inbox_id: payload.template.inbox_id ?? null,
           name: payload.name,
           template_name: payload.template.name,
           template_language: payload.template.language ?? 'en_US',
@@ -466,6 +468,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
               recipients: apiRecipients,
               template_name: payload.template.name,
               template_language: payload.template.language ?? 'en_US',
+              inbox_id: payload.template.inbox_id ?? undefined,
             }),
           });
 
@@ -597,6 +600,8 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         .insert({
           user_id: user.id,
           account_id: accountId,
+          // The template's WABA is the sending number (033).
+          inbox_id: payload.template.inbox_id ?? null,
           name: payload.name,
           template_name: payload.template.name,
           template_language: payload.template.language ?? 'en_US',

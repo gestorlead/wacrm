@@ -3,7 +3,11 @@ import { createClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { normalizePhone } from '@/lib/whatsapp/phone-utils'
-import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe'
+import { isUniqueViolation } from '@/lib/contacts/dedupe'
+import {
+  resolveContactInbox,
+  findOrCreateConversation,
+} from '@/lib/channels/inbound'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
@@ -338,6 +342,9 @@ export async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           // Tenancy — drives every contact / conversation lookup
           // and the engines' active-row dispatch.
           config.account_id,
+          // The inbox that owns this number — routes the conversation
+          // and the contact_inbox link (multi-inbox).
+          config.inbox_id,
           // Audit / sender-of-record — used as the user_id on row
           // inserts that need it for NOT NULL FK compliance. Always
           // the admin who saved the WhatsApp config.
@@ -543,9 +550,24 @@ async function storeOutboundEcho(echo: WhatsAppMessage, config: any, accessToken
   if (await messageAlreadyStored(echo.id)) return
 
   const customerPhone = normalizePhone(customerPhoneRaw)
-  const contactOutcome = await findOrCreateContact(config.account_id, config.user_id, customerPhone, '')
+  const contactOutcome = await resolveContactInbox({
+    db: supabaseAdmin(),
+    inboxId: config.inbox_id,
+    accountId: config.account_id,
+    channelType: 'whatsapp',
+    sourceId: customerPhone,
+    name: '',
+    userId: config.user_id,
+  })
   if (!contactOutcome) return
-  const conversation = await findOrCreateConversation(config.account_id, config.user_id, contactOutcome.contact.id)
+  const conversation = await findOrCreateConversation({
+    db: supabaseAdmin(),
+    accountId: config.account_id,
+    inboxId: config.inbox_id,
+    userId: config.user_id,
+    contactId: contactOutcome.contact.id,
+    contactInboxId: contactOutcome.contactInbox.id,
+  })
   if (!conversation) return
 
   // Reactions aren't standalone messages — skip (same as the inbound path).
@@ -638,18 +660,24 @@ async function storeHistoricalMessage(
   if (await messageAlreadyStored(msg.id)) return
 
   const counterpart = normalizePhone(counterpartRaw)
-  const contactOutcome = await findOrCreateContact(
-    config.account_id,
-    config.user_id,
-    counterpart,
-    nameByPhone.get(counterpart) ?? '',
-  )
+  const contactOutcome = await resolveContactInbox({
+    db: supabaseAdmin(),
+    inboxId: config.inbox_id,
+    accountId: config.account_id,
+    channelType: 'whatsapp',
+    sourceId: counterpart,
+    name: nameByPhone.get(counterpart) ?? '',
+    userId: config.user_id,
+  })
   if (!contactOutcome) return
-  const conversation = await findOrCreateConversation(
-    config.account_id,
-    config.user_id,
-    contactOutcome.contact.id,
-  )
+  const conversation = await findOrCreateConversation({
+    db: supabaseAdmin(),
+    accountId: config.account_id,
+    inboxId: config.inbox_id,
+    userId: config.user_id,
+    contactId: contactOutcome.contact.id,
+    contactInboxId: contactOutcome.contactInbox.id,
+  })
   if (!conversation) return
 
   const { contentText, mediaUrl, interactiveReplyId } = await parseMessageContent(msg, accessToken, config.account_id)
@@ -801,6 +829,8 @@ async function processMessage(
   // contact / conversation / message row created downstream is
   // stamped with this so any member of the account can see it.
   accountId: string,
+  // Inbox that owns the number — routes the conversation + contact_inbox.
+  inboxId: string,
   // Sender-of-record for inserts that need a NOT NULL user_id FK
   // (contacts, conversations). Always the admin who saved the
   // WhatsApp config; the choice is arbitrary post-017 but stable.
@@ -810,26 +840,32 @@ async function processMessage(
   const senderPhone = normalizePhone(message.from)
   // Meta omits `profile` on some inbound payloads (sender hasn't shared a
   // WhatsApp profile name, certain number types). Guard so we don't crash
-  // and silently drop the message — findOrCreateContact falls back to the
+  // and silently drop the message — resolveContactInbox falls back to the
   // phone number when the name is empty.
   const contactName = contact.profile?.name ?? ''
 
-  // Find or create contact
-  const contactOutcome = await findOrCreateContact(
+  // Resolve contact + contact_inbox (source_id = phone for WhatsApp)
+  const contactOutcome = await resolveContactInbox({
+    db: supabaseAdmin(),
+    inboxId,
     accountId,
-    configOwnerUserId,
-    senderPhone,
-    contactName
-  )
+    channelType: 'whatsapp',
+    sourceId: senderPhone,
+    name: contactName,
+    userId: configOwnerUserId,
+  })
   if (!contactOutcome) return
   const contactRecord = contactOutcome.contact
 
-  // Find or create conversation
-  const conversation = await findOrCreateConversation(
+  // Find or create conversation for (inbox, contact)
+  const conversation = await findOrCreateConversation({
+    db: supabaseAdmin(),
     accountId,
-    configOwnerUserId,
-    contactRecord.id
-  )
+    inboxId,
+    userId: configOwnerUserId,
+    contactId: contactRecord.id,
+    contactInboxId: contactOutcome.contactInbox.id,
+  })
   if (!conversation) return
 
   // Reactions short-circuit here — they aren't messages. We never insert
@@ -999,7 +1035,7 @@ async function processMessage(
   // manually-imported contacts sending for the first time. We dispatch both
   // so users can pick whichever semantic they want; an automation that
   // listens to only one trigger runs only when that trigger matches.
-  if (contactOutcome.wasCreated) automationTriggers.unshift('new_contact_created')
+  if (contactOutcome.contactWasCreated) automationTriggers.unshift('new_contact_created')
   if (isFirstInboundMessage) automationTriggers.unshift('first_inbound_message')
   for (const triggerType of automationTriggers) {
     runAutomationsForTrigger({
@@ -1234,109 +1270,6 @@ async function parseMessageContent(
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ContactRow = any
-
-interface ContactOutcome {
-  contact: ContactRow
-  /** True when this call created the row; drives new_contact_created
-   *  automation dispatch in processMessage. */
-  wasCreated: boolean
-}
-
-async function findOrCreateContact(
-  accountId: string,
-  configOwnerUserId: string,
-  phone: string,
-  name: string
-): Promise<ContactOutcome | null> {
-  // Find an existing contact for this account by phone. The shared
-  // helper pre-filters in SQL by the last-8-digit suffix (so we don't
-  // pull every contact on every inbound message) then applies the
-  // strict `phonesMatch` in JS on the small candidate set. The same
-  // helper backs the manual contact form and CSV import, so all three
-  // paths agree on what "same number" means (issue #212).
-  const existingContact = await findExistingContact(
-    supabaseAdmin(),
-    accountId,
-    phone,
-  )
-
-  if (existingContact) {
-    // Update name if it changed
-    if (name && name !== existingContact.name) {
-      await supabaseAdmin()
-        .from('contacts')
-        .update({ name, updated_at: new Date().toISOString() })
-        .eq('id', existingContact.id)
-    }
-    return { contact: existingContact, wasCreated: false }
-  }
-
-  // Create new contact. account_id is the tenancy column;
-  // user_id is the NOT NULL FK audit column (no inbound message
-  // has a single "user who created" it — we attribute to the
-  // WhatsApp config owner as a stable default).
-  const { data: newContact, error: createError } = await supabaseAdmin()
-    .from('contacts')
-    .insert({
-      account_id: accountId,
-      user_id: configOwnerUserId,
-      phone,
-      name: name || phone,
-    })
-    .select()
-    .single()
-
-  if (createError) {
-    // Lost a race: a concurrent inbound delivery (or another path)
-    // created this contact between our lookup and insert, and the
-    // unique index (migration 022) rejected the duplicate. Re-resolve
-    // the existing row instead of dropping the message.
-    if (isUniqueViolation(createError)) {
-      const raced = await findExistingContact(supabaseAdmin(), accountId, phone)
-      if (raced) return { contact: raced, wasCreated: false }
-    }
-    console.error('Error creating contact:', createError)
-    return null
-  }
-
-  return { contact: newContact, wasCreated: true }
-}
-
-async function findOrCreateConversation(
-  accountId: string,
-  configOwnerUserId: string,
-  contactId: string,
-) {
-  // Look for existing conversation in this account
-  const { data: existing, error: findError } = await supabaseAdmin()
-    .from('conversations')
-    .select('*')
-    .eq('account_id', accountId)
-    .eq('contact_id', contactId)
-    .single()
-
-  if (!findError && existing) {
-    return existing
-  }
-
-  // Create new conversation. Same tenancy + audit split as
-  // findOrCreateContact above.
-  const { data: newConv, error: createError } = await supabaseAdmin()
-    .from('conversations')
-    .insert({
-      account_id: accountId,
-      user_id: configOwnerUserId,
-      contact_id: contactId,
-    })
-    .select()
-    .single()
-
-  if (createError) {
-    console.error('Error creating conversation:', createError)
-    return null
-  }
-
-  return newConv
-}
+// Contact + conversation resolution moved to @/lib/channels/inbound
+// (resolveContactInbox / findOrCreateConversation) — channel-agnostic and
+// keyed on (inbox_id, source_id) instead of account-scoped phone lookups.

@@ -161,21 +161,41 @@ export async function POST(request: Request) {
 
     // Idempotent upsert (UNIQUE(account_id) → ≤1 row per account). Used
     // for the initial write and the later status/timestamp patches.
+    // Idempotent upsert keyed by phone_number_id within the account
+    // (multi-inbox: each number is its own inbox + config row, so we can't
+    // key by account_id anymore). The first call creates the inbox and the
+    // config; later status/timestamp patches find the row by its number.
     const upsertConfig = async (patch: Record<string, unknown>) => {
       const { data: existing } = await supabase
         .from('whatsapp_config')
         .select('id')
         .eq('account_id', accountId)
+        .eq('phone_number_id', selectedPhoneNumberId)
         .maybeSingle()
       if (existing) {
         return supabase
           .from('whatsapp_config')
           .update({ ...patch, updated_at: new Date().toISOString() })
-          .eq('account_id', accountId)
+          .eq('id', existing.id)
       }
+      // First write — create the inbox this number lives in, then the
+      // config that references it. The connecting admin becomes a member.
+      const { data: inbox, error: inboxErr } = await supabase
+        .from('inboxes')
+        .insert({
+          account_id: accountId,
+          name: 'WhatsApp' + (displayPhoneNumber ? ` ${displayPhoneNumber}` : ''),
+          channel_type: 'whatsapp',
+        })
+        .select('id')
+        .single()
+      if (inboxErr || !inbox) {
+        return { error: inboxErr ?? new Error('failed to create inbox') }
+      }
+      await supabase.from('inbox_members').insert({ inbox_id: inbox.id, user_id: userId })
       return supabase
         .from('whatsapp_config')
-        .insert({ account_id: accountId, user_id: userId, ...patch })
+        .insert({ account_id: accountId, user_id: userId, inbox_id: inbox.id, ...patch })
     }
 
     const { error: preSaveError } = await upsertConfig({
@@ -281,8 +301,18 @@ export async function POST(request: Request) {
       )
     }
 
+    // Resolve the inbox this number landed in so the caller (the new-inbox
+    // wizard) can jump straight to the "add agents" step.
+    const { data: savedRow } = await supabase
+      .from('whatsapp_config')
+      .select('inbox_id')
+      .eq('account_id', accountId)
+      .eq('phone_number_id', selectedPhoneNumberId)
+      .maybeSingle()
+
     return NextResponse.json({
       success: true,
+      inbox_id: savedRow?.inbox_id ?? null,
       phone_number_id: selectedPhoneNumberId,
       display_phone_number: displayPhoneNumber,
       waba_id,

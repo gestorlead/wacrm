@@ -123,7 +123,7 @@ function emptyButton(type: TemplateButton['type']): TemplateButton {
   }
 }
 
-export function TemplateManager() {
+export function TemplateManager({ inboxId }: { inboxId?: string } = {}) {
   const supabase = createClient();
   const { user, loading: authLoading } = useAuth();
 
@@ -188,11 +188,12 @@ export function TemplateManager() {
   async function fetchTemplates(userId: string) {
     try {
       setLoading(true);
-      const { data, error } = await supabase
-        .from('message_templates')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false });
+      // Per-inbox (033): scope to this inbox's WABA when embedded in the
+      // inbox settings. RLS already limits visibility; the filter narrows
+      // the list to the inbox the user is managing.
+      let query = supabase.from('message_templates').select('*');
+      query = inboxId ? query.eq('inbox_id', inboxId) : query.eq('user_id', userId);
+      const { data, error } = await query.order('created_at', { ascending: false });
       if (error) throw error;
       setTemplates(data || []);
     } catch (err) {
@@ -228,6 +229,8 @@ export function TemplateManager() {
       buttons: form.buttons.length > 0 ? form.buttons : undefined,
       sample_values:
         Object.keys(sample_values).length > 0 ? sample_values : undefined,
+      // WABA scope (033) — the submit route requires it for new templates.
+      inbox_id: inboxId,
     };
   }
 
@@ -303,7 +306,11 @@ export function TemplateManager() {
     if (!user) return;
     setSyncing(true);
     try {
-      const res = await fetch('/api/whatsapp/templates/sync', { method: 'POST' });
+      const res = await fetch('/api/whatsapp/templates/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inbox_id: inboxId }),
+      });
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data?.error || `Sync failed (HTTP ${res.status})`);

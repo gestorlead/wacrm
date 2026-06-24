@@ -15,6 +15,7 @@ import {
   rateLimitResponse,
   RATE_LIMITS,
 } from '@/lib/rate-limit'
+import { getInboxChannel } from '@/lib/channels/config-resolver'
 
 interface BroadcastResult {
   phone: string
@@ -103,6 +104,7 @@ export async function POST(request: Request) {
       template_name,
       template_language,
       template_params,
+      inbox_id,
     } = body
 
     // Normalize to a list of {phone, params} regardless of shape.
@@ -134,13 +136,25 @@ export async function POST(request: Request) {
       )
     }
 
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
+    // Resolve which number sends (multi-inbox). When the caller picks an
+    // inbox, send through it; otherwise fall back to the account's first
+    // connected number. `.limit(1)` avoids the `.single()` throw an account
+    // with several configs would now trigger.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let config: any = null
+    if (inbox_id) {
+      const channel = await getInboxChannel(supabase, inbox_id)
+      config = channel?.config ?? null
+    } else {
+      const { data: configs } = await supabase
+        .from('whatsapp_config')
+        .select('*')
+        .eq('account_id', accountId)
+        .limit(1)
+      config = configs?.[0] ?? null
+    }
 
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         {
           error:
@@ -157,13 +171,16 @@ export async function POST(request: Request) {
     // the loop would N+1 against Supabase for every recipient.
     // Guard against a malformed local row crashing every send in
     // the loop with the same opaque TypeError — fail loudly once.
-    const { data: rawTemplateRow } = await supabase
+    // Scope the template to the sending inbox's WABA when one was chosen,
+    // so same-named templates across inboxes don't collide.
+    let templateQuery = supabase
       .from('message_templates')
       .select('*')
       .eq('account_id', accountId)
       .eq('name', template_name)
       .eq('language', template_language || 'en_US')
-      .maybeSingle()
+    if (inbox_id) templateQuery = templateQuery.eq('inbox_id', inbox_id)
+    const { data: rawTemplateRow } = await templateQuery.maybeSingle()
     if (rawTemplateRow && !isMessageTemplate(rawTemplateRow)) {
       return NextResponse.json(
         {

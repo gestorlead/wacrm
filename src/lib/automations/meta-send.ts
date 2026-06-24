@@ -7,6 +7,7 @@ import {
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
 import { supabaseAdmin } from './admin-client'
+import { getChannelForConversation } from '@/lib/channels/config-resolver'
 
 // ------------------------------------------------------------
 // Automation-side Meta sender.
@@ -83,14 +84,13 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+  // Resolve the channel from the conversation's inbox (multi-inbox): the
+  // automation sends through the same number that owns the thread.
+  const channel = await getChannelForConversation(db, input.conversationId)
+  if (!channel) {
+    throw new Error("WhatsApp not configured for this conversation's inbox")
   }
+  const config = channel.config
 
   const accessToken = decrypt(config.access_token)
 
