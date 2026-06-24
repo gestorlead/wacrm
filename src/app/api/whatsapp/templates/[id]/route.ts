@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { decrypt } from '@/lib/whatsapp/encryption'
+import { getInboxChannel } from '@/lib/channels/config-resolver'
 import {
   deleteMessageTemplate,
   editMessageTemplate,
@@ -91,7 +92,7 @@ export async function PATCH(
     // meta_template_id and status — fetch explicitly.
     const { data: existing, error: lookupErr } = await supabase
       .from('message_templates')
-      .select('id, name, status, meta_template_id, language')
+      .select('id, name, status, meta_template_id, language, inbox_id')
       .eq('id', id)
       .eq('account_id', accountId)
       .maybeSingle()
@@ -138,14 +139,15 @@ export async function PATCH(
     }
 
     if (!isDryRun()) {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config) {
+      // Resolve the config for the WABA that owns THIS template (033) —
+      // editing on Meta requires the token of the template's own WABA.
+      const channel = existing.inbox_id
+        ? await getInboxChannel(supabase, existing.inbox_id)
+        : null
+      const config = channel?.config ?? null
+      if (!config) {
         return NextResponse.json(
-          { error: 'WhatsApp not configured.' },
+          { error: 'WhatsApp not configured for this template\'s inbox.' },
           { status: 400 },
         )
       }
@@ -269,7 +271,7 @@ export async function DELETE(
 
     const { data: existing, error: lookupErr } = await supabase
       .from('message_templates')
-      .select('id, name, meta_template_id')
+      .select('id, name, meta_template_id, inbox_id')
       .eq('id', id)
       .eq('account_id', accountId)
       .maybeSingle()
@@ -278,12 +280,12 @@ export async function DELETE(
     }
 
     if (existing.meta_template_id && !isDryRun()) {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config || !config.waba_id) {
+      // Delete on the WABA that owns this template (033).
+      const channel = existing.inbox_id
+        ? await getInboxChannel(supabase, existing.inbox_id)
+        : null
+      const config = channel?.config ?? null
+      if (!config || !config.waba_id) {
         return NextResponse.json(
           { error: 'WhatsApp not configured — cannot delete on Meta.' },
           { status: 400 },

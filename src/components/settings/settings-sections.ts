@@ -1,9 +1,8 @@
 import {
   Coins,
-  FileText,
+  Inbox,
   LayoutGrid,
   Palette,
-  PlugZap,
   Shield,
   Tags,
   User,
@@ -24,8 +23,7 @@ export const SETTINGS_SECTIONS = [
   'profile',
   'security',
   'appearance',
-  'whatsapp',
-  'templates',
+  'inboxes',
   'fields',
   'deals',
   'members',
@@ -48,8 +46,7 @@ export const SECTION_META: Record<SettingsSection, SectionMeta> = {
   profile: { id: 'profile', label: 'Your profile', icon: User, group: 'account' },
   security: { id: 'security', label: 'Login & security', icon: Shield, group: 'account' },
   appearance: { id: 'appearance', label: 'Appearance', icon: Palette, group: 'account' },
-  whatsapp: { id: 'whatsapp', label: 'WhatsApp', icon: PlugZap, group: 'workspace' },
-  templates: { id: 'templates', label: 'Templates', icon: FileText, group: 'workspace' },
+  inboxes: { id: 'inboxes', label: 'Inboxes', icon: Inbox, group: 'workspace' },
   fields: { id: 'fields', label: 'Fields & tags', icon: Tags, group: 'workspace' },
   deals: { id: 'deals', label: 'Deals & currency', icon: Coins, group: 'workspace' },
   members: { id: 'members', label: 'Team members', icon: UsersRound, group: 'workspace' },
@@ -73,6 +70,10 @@ function isSection(value: string | null): value is SettingsSection {
  */
 export function resolveSection(raw: string | null): SettingsSection {
   if (raw === 'tags' || raw === 'custom-fields') return 'fields';
+  // Legacy single-WhatsApp tab now lives under the multi-inbox section.
+  if (raw === 'whatsapp') return 'inboxes';
+  // Templates moved into each inbox (per-WABA, migration 033).
+  if (raw === 'templates') return 'inboxes';
   if (isSection(raw)) return raw;
   return DEFAULT_SECTION;
 }

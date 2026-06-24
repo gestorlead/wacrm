@@ -9,6 +9,10 @@ import {
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
+import {
+  getInboxChannel,
+  type WhatsAppConfigRow,
+} from '@/lib/channels/config-resolver'
 
 /**
  * Send due SCHEDULED broadcasts. Hit on a schedule with the shared
@@ -119,11 +123,22 @@ async function drainBroadcast(
   broadcast: any,
   budget: number
 ): Promise<number> {
-  const { data: config } = await admin
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', broadcast.account_id)
-    .maybeSingle()
+  // Resolve the sending number (multi-inbox): the broadcast's chosen
+  // inbox, falling back to the account's first connected number for legacy
+  // rows that predate `broadcasts.inbox_id`.
+  let config: WhatsAppConfigRow | null = null
+  if (broadcast.inbox_id) {
+    const channel = await getInboxChannel(admin, broadcast.inbox_id)
+    config = channel?.config ?? null
+  }
+  if (!config) {
+    const { data: configs } = await admin
+      .from('whatsapp_config')
+      .select('*')
+      .eq('account_id', broadcast.account_id)
+      .limit(1)
+    config = configs?.[0] ?? null
+  }
   if (!config) {
     await admin.from('broadcasts').update({ status: 'failed' }).eq('id', broadcast.id)
     return 0
@@ -137,13 +152,16 @@ async function drainBroadcast(
     return 0
   }
 
-  const { data: rawTemplate } = await admin
+  // Resolve the template within the broadcast's inbox (WABA) when known,
+  // so a same-named template in another inbox can't be picked by mistake.
+  let templateQuery = admin
     .from('message_templates')
     .select('*')
     .eq('account_id', broadcast.account_id)
     .eq('name', broadcast.template_name)
     .eq('language', broadcast.template_language)
-    .maybeSingle()
+  if (broadcast.inbox_id) templateQuery = templateQuery.eq('inbox_id', broadcast.inbox_id)
+  const { data: rawTemplate } = await templateQuery.maybeSingle()
   const template =
     rawTemplate && isMessageTemplate(rawTemplate) ? rawTemplate : undefined
 

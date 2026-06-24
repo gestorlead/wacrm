@@ -21,6 +21,7 @@ import {
 } from '@/lib/rate-limit'
 import type { MessageTemplate } from '@/types'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
+import { getInboxChannel } from '@/lib/channels/config-resolver'
 
 /** Best-effort extraction of Meta's numeric error code from an error
  *  message (e.g. "(#131047) Re-engagement message..."). Returns null when
@@ -203,19 +204,17 @@ export async function POST(request: Request) {
       }
     }
 
-    // Fetch and decrypt WhatsApp config
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
-
-    if (configError || !config) {
+    // Resolve the channel config from the conversation's inbox (multi-inbox).
+    // The reply goes out through the SAME number that owns the conversation,
+    // not "the account's number" (an account can now have several).
+    const channel = await getInboxChannel(supabase, conversation.inbox_id)
+    if (!channel) {
       return NextResponse.json(
-        { error: 'WhatsApp not configured. Please set up your WhatsApp integration first.' },
+        { error: 'WhatsApp not configured for this inbox. Please set up the channel first.' },
         { status: 400 }
       )
     }
+    const config = channel.config
 
     const accessToken = decrypt(config.access_token)
 

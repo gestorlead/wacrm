@@ -6,6 +6,10 @@ import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { toast } from 'sonner';
 import { MessageTemplate } from '@/types';
+import {
+  Step0ChooseInbox,
+  type SelectedInbox,
+} from '@/components/broadcasts/step0-choose-inbox';
 import { Step1ChooseTemplate } from '@/components/broadcasts/step1-choose-template';
 import { Step2SelectAudience } from '@/components/broadcasts/step2-select-audience';
 import { Step3Personalize } from '@/components/broadcasts/step3-personalize';
@@ -14,6 +18,7 @@ import { useBroadcastSending } from '@/hooks/use-broadcast-sending';
 import { Check } from 'lucide-react';
 
 const steps = [
+  { label: 'Inbox', key: 'inbox' },
   { label: 'Template', key: 'template' },
   { label: 'Audience', key: 'audience' },
   { label: 'Personalize', key: 'personalize' },
@@ -27,7 +32,16 @@ export default function NewBroadcastPage() {
     useBroadcastSending();
 
   const [currentStep, setCurrentStep] = useState(0);
+  const [inbox, setInbox] = useState<SelectedInbox | null>(null);
   const [template, setTemplate] = useState<MessageTemplate | null>(null);
+
+  // Switching inbox invalidates a template chosen under the previous one.
+  function handleSelectInbox(next: SelectedInbox) {
+    setInbox((prev) => {
+      if (prev && prev.id !== next.id) setTemplate(null);
+      return next;
+    });
+  }
   const [audience, setAudience] = useState<{
     type: 'all' | 'tags' | 'custom_field' | 'csv';
     tagIds?: string[];
@@ -213,31 +227,40 @@ export default function NewBroadcastPage() {
           }}
         >
           {currentStep === 0 && (
-            <Step1ChooseTemplate
-              selectedTemplate={template}
-              onSelect={setTemplate}
+            <Step0ChooseInbox
+              selectedInbox={inbox}
+              onSelect={handleSelectInbox}
               onNext={() => setCurrentStep(1)}
               onBack={() => router.push('/broadcasts')}
             />
           )}
           {currentStep === 1 && (
-            <Step2SelectAudience
-              audience={audience}
-              onUpdate={setAudience}
+            <Step1ChooseTemplate
+              inboxId={inbox?.id}
+              selectedTemplate={template}
+              onSelect={setTemplate}
               onNext={() => setCurrentStep(2)}
               onBack={() => setCurrentStep(0)}
             />
           )}
-          {currentStep === 2 && template && (
-            <Step3Personalize
-              template={template}
-              variables={variables}
-              onUpdate={setVariables}
+          {currentStep === 2 && (
+            <Step2SelectAudience
+              audience={audience}
+              onUpdate={setAudience}
               onNext={() => setCurrentStep(3)}
               onBack={() => setCurrentStep(1)}
             />
           )}
           {currentStep === 3 && template && (
+            <Step3Personalize
+              template={template}
+              variables={variables}
+              onUpdate={setVariables}
+              onNext={() => setCurrentStep(4)}
+              onBack={() => setCurrentStep(2)}
+            />
+          )}
+          {currentStep === 4 && template && (
             <Step4ScheduleSend
               name={name}
               onNameChange={setName}
@@ -246,7 +269,7 @@ export default function NewBroadcastPage() {
               onSend={handleSend}
               onSchedule={handleSchedule}
               onSaveDraft={handleSaveDraft}
-              onBack={() => setCurrentStep(2)}
+              onBack={() => setCurrentStep(3)}
               isProcessing={isProcessing}
               progress={progress}
             />

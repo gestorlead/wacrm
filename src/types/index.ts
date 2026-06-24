@@ -142,12 +142,70 @@ export interface ContactNote {
   created_at: string;
 }
 
+// ============================================================
+// Inboxes / channels (032_multi_inbox.sql)
+// ============================================================
+
+/** Channel kind an inbox connects. Only 'whatsapp' is implemented;
+ *  the others are reserved so the UI can offer "coming soon" slots. */
+export type ChannelType = 'whatsapp' | 'instagram' | 'messenger';
+
+export interface Inbox {
+  id: string;
+  account_id: string;
+  name: string;
+  channel_type: ChannelType;
+  /** Badge colour for the UI; null when unset. */
+  color?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** An inbox row enriched with connection + membership info for the
+ *  settings list (shape returned by GET /api/inboxes). */
+export interface InboxWithStatus {
+  id: string;
+  name: string;
+  channel_type: ChannelType;
+  color?: string | null;
+  created_at: string;
+  connection: {
+    configured: boolean;
+    status: 'connected' | 'disconnected';
+    registered: boolean;
+    phone_number_id: string | null;
+  };
+  member_count: number;
+}
+
+export interface InboxMember {
+  id: string;
+  inbox_id: string;
+  user_id: string;
+  created_at: string;
+}
+
+/** Links a contact to an inbox via its channel identity (`source_id`:
+ *  phone for WhatsApp, IGSID/PSID for future channels). */
+export interface ContactInbox {
+  id: string;
+  account_id: string;
+  contact_id: string;
+  inbox_id: string;
+  source_id: string;
+  created_at: string;
+}
+
 export type ConversationStatus = 'open' | 'pending' | 'closed';
 
 export interface Conversation {
   id: string;
   user_id: string;
   contact_id: string;
+  /** Inbox that owns this thread (032_multi_inbox.sql). NOT NULL in DB. */
+  inbox_id: string;
+  /** The contact↔inbox link this conversation belongs to. */
+  contact_inbox_id?: string;
   status: ConversationStatus;
   assigned_agent_id?: string;
   last_message_text?: string;
@@ -156,6 +214,7 @@ export interface Conversation {
   created_at: string;
   updated_at: string;
   contact?: Contact;
+  inbox?: Inbox;
 }
 
 export type SenderType = 'customer' | 'agent' | 'bot';
@@ -212,6 +271,8 @@ export interface MessageReaction {
 export interface WhatsAppConfig {
   id: string;
   user_id: string;
+  /** Inbox this channel config belongs to (032_multi_inbox.sql). */
+  inbox_id: string;
   phone_number_id: string;
   waba_id?: string;
   access_token: string;
@@ -266,6 +327,9 @@ export interface TemplateSampleValues {
 export interface MessageTemplate {
   id: string;
   user_id: string;
+  /** Inbox (WABA) that owns this template — migration 033. Null only for
+   *  legacy rows created before any number was connected. */
+  inbox_id?: string | null;
   name: string;
   category: 'Marketing' | 'Utility' | 'Authentication';
   language?: string;
@@ -335,6 +399,9 @@ export type RecipientStatus = 'pending' | 'sent' | 'delivered' | 'read' | 'repli
 export interface Broadcast {
   id: string;
   user_id: string;
+  /** Inbox (sending number) for the broadcast; null on legacy rows —
+   *  the runner falls back to the account's primary number. */
+  inbox_id?: string | null;
   name: string;
   template_name: string;
   template_language: string;

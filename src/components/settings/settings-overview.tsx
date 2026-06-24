@@ -116,17 +116,19 @@ export function SettingsOverview({
     // WhatsApp connection status — slower, independent.
     (async () => {
       setWhatsappLoading(true);
-      const [row, health] = await Promise.allSettled([
+      const [rows, health] = await Promise.allSettled([
+        // Multi-inbox: an account can have several numbers. "Configured"
+        // means at least one is connected.
         supabase
           .from('whatsapp_config')
           .select('phone_number_id')
-          .eq('account_id', acctId)
-          .maybeSingle(),
+          .eq('account_id', acctId),
         fetch('/api/whatsapp/config', { cache: 'no-store' }).then((r) => r.json()),
       ]);
       if (cancelled) return;
       setWhatsapp({
-        configured: row.status === 'fulfilled' && !!row.value.data?.phone_number_id,
+        configured:
+          rows.status === 'fulfilled' && (rows.value.data?.length ?? 0) > 0,
         connected: health.status === 'fulfilled' && !!health.value?.connected,
       });
       setWhatsappLoading(false);
@@ -155,7 +157,7 @@ export function SettingsOverview({
     subtitle: ReactNode;
   }[] = [
     {
-      section: 'whatsapp',
+      section: 'inboxes',
       loading: whatsappLoading,
       subtitle: !whatsapp?.configured ? (
         'Not set up yet'
@@ -180,18 +182,6 @@ export function SettingsOverview({
                 ? ` · ${counts.pendingInvites} pending invite${
                     counts.pendingInvites === 1 ? '' : 's'
                   }`
-                : ''
-            }`,
-    },
-    {
-      section: 'templates',
-      loading: countsLoading,
-      subtitle:
-        counts?.templates == null
-          ? 'Manage message templates'
-          : `${counts.templates} template${counts.templates === 1 ? '' : 's'}${
-              counts.templatesPending
-                ? ` · ${counts.templatesPending} pending review`
                 : ''
             }`,
     },

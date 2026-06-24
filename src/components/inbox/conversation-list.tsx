@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { channelDef } from "@/lib/channels/registry";
 
 interface ConversationListProps {
   activeConversationId: string | null;
@@ -55,6 +56,9 @@ export function ConversationList({
 }: ConversationListProps) {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<InboxFilter>("all");
+  // Multi-inbox: "all" or a specific inbox id. Options are derived from the
+  // loaded conversations, so no extra fetch is needed.
+  const [inboxFilter, setInboxFilter] = useState<string>("all");
   const [loading, setLoading] = useState(true);
 
   // Keep the latest callback in a ref so the fetch effect below can
@@ -81,7 +85,7 @@ export function ConversationList({
     (async () => {
       const { data, error } = await supabase
         .from("conversations")
-        .select("*, contact:contacts(*)")
+        .select("*, contact:contacts(*), inbox:inboxes(id, name, channel_type, color)")
         .order("last_message_at", { ascending: false });
 
       if (cancelled) return;
@@ -110,8 +114,22 @@ export function ConversationList({
     // up on any events sent while the WS was disconnected or throttled.
   }, [resyncToken]);
 
+  // Unique inboxes present in the loaded conversations — drives the inbox
+  // filter dropdown. Only shown when the account has more than one.
+  const inboxOptions = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const c of conversations) {
+      if (c.inbox?.id) map.set(c.inbox.id, c.inbox.name);
+    }
+    return [...map.entries()].map(([id, name]) => ({ id, name }));
+  }, [conversations]);
+
   const filtered = useMemo(() => {
     let result = conversations;
+
+    if (inboxFilter !== "all") {
+      result = result.filter((c) => c.inbox_id === inboxFilter);
+    }
 
     if (filter === "unread") {
       result = result.filter((c) => c.unread_count > 0);
@@ -130,7 +148,7 @@ export function ConversationList({
     }
 
     return result;
-  }, [conversations, filter, search]);
+  }, [conversations, filter, search, inboxFilter]);
 
   const handleSearchChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -165,31 +183,64 @@ export function ConversationList({
           />
         </div>
 
-        <DropdownMenu>
-          <DropdownMenuTrigger className="inline-flex items-center justify-center h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground rounded-md hover:bg-muted">
-              {activeFilter?.label ?? "All"}
-              <ChevronDown className="h-3 w-3" />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            align="start"
-            className="border-border bg-popover"
-          >
-            {FILTER_OPTIONS.map((opt) => (
-              <DropdownMenuItem
-                key={opt.value}
-                onClick={() => setFilter(opt.value)}
-                className={cn(
-                  "text-sm",
-                  filter === opt.value
-                    ? "text-primary"
-                    : "text-popover-foreground"
-                )}
-              >
-                {opt.label}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <div className="flex items-center gap-1">
+          <DropdownMenu>
+            <DropdownMenuTrigger className="inline-flex items-center justify-center h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground rounded-md hover:bg-muted">
+                {activeFilter?.label ?? "All"}
+                <ChevronDown className="h-3 w-3" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="border-border bg-popover"
+            >
+              {FILTER_OPTIONS.map((opt) => (
+                <DropdownMenuItem
+                  key={opt.value}
+                  onClick={() => setFilter(opt.value)}
+                  className={cn(
+                    "text-sm",
+                    filter === opt.value
+                      ? "text-primary"
+                      : "text-popover-foreground"
+                  )}
+                >
+                  {opt.label}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {inboxOptions.length > 1 ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger className="inline-flex items-center justify-center h-7 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground rounded-md hover:bg-muted">
+                {inboxFilter === "all"
+                  ? "Todos os inboxes"
+                  : (inboxOptions.find((i) => i.id === inboxFilter)?.name ?? "Inbox")}
+                <ChevronDown className="h-3 w-3" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="border-border bg-popover">
+                <DropdownMenuItem
+                  onClick={() => setInboxFilter("all")}
+                  className={cn("text-sm", inboxFilter === "all" ? "text-primary" : "text-popover-foreground")}
+                >
+                  Todos os inboxes
+                </DropdownMenuItem>
+                {inboxOptions.map((opt) => (
+                  <DropdownMenuItem
+                    key={opt.id}
+                    onClick={() => setInboxFilter(opt.id)}
+                    className={cn(
+                      "text-sm",
+                      inboxFilter === opt.id ? "text-primary" : "text-popover-foreground",
+                    )}
+                  >
+                    {opt.name}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
+        </div>
       </div>
 
       {/* Conversation Items.
@@ -249,6 +300,12 @@ function ConversationItem({
       })
     : "";
 
+  // Channel indicator (multi-inbox): a small icon on the avatar corner so
+  // agents can tell WhatsApp / Instagram / Messenger threads apart at a glance.
+  const inbox = conversation.inbox;
+  const channel = inbox ? channelDef(inbox.channel_type) : undefined;
+  const ChannelIcon = channel?.icon;
+
   return (
     <button
       onClick={handleClick}
@@ -256,18 +313,31 @@ function ConversationItem({
         "flex w-full items-start gap-3 px-3 py-3 text-left transition-colors hover:bg-muted/50",
         isActive && "border-l-2 border-primary bg-muted/70"
       )}
+      title={inbox?.name}
     >
       {/* Avatar */}
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
-        {contact?.avatar_url ? (
-          <img
-            src={contact.avatar_url}
-            alt={displayName}
-            className="h-10 w-10 rounded-full object-cover"
-          />
-        ) : (
-          initials
-        )}
+      <div className="relative shrink-0">
+        <div className="flex h-10 w-10 items-center justify-center rounded-full bg-muted text-sm font-medium text-foreground">
+          {contact?.avatar_url ? (
+            <img
+              src={contact.avatar_url}
+              alt={displayName}
+              className="h-10 w-10 rounded-full object-cover"
+            />
+          ) : (
+            initials
+          )}
+        </div>
+        {ChannelIcon ? (
+          <span
+            className={cn(
+              "absolute -bottom-0.5 -right-0.5 flex size-4 items-center justify-center rounded-full ring-2 ring-card",
+              channel?.accent ?? "bg-muted",
+            )}
+          >
+            <ChannelIcon className="size-2.5" />
+          </span>
+        ) : null}
       </div>
 
       {/* Content */}

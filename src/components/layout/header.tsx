@@ -120,7 +120,7 @@ export function Header({ onOpenSidebar }: HeaderProps) {
           <DropdownMenuItem
             render={
               <Link
-                href="/settings?tab=whatsapp"
+                href="/settings?tab=inboxes"
                 className="text-popover-foreground focus:bg-accent focus:text-accent-foreground"
               />
             }

@@ -15,6 +15,7 @@ import {
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
 import { supabaseAdmin } from './admin-client'
+import { getChannelForConversation } from '@/lib/channels/config-resolver'
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -77,14 +78,13 @@ export async function engineSendText(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+  // Resolve the channel from the conversation's inbox (multi-inbox): the
+  // bot replies through the same number that owns the thread.
+  const channel = await getChannelForConversation(db, args.conversationId)
+  if (!channel) {
+    throw new Error("WhatsApp not configured for this conversation's inbox")
   }
+  const config = channel.config
 
   const accessToken = decrypt(config.access_token)
 
@@ -186,14 +186,11 @@ export async function engineSendMedia(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', args.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+  const channel = await getChannelForConversation(db, args.conversationId)
+  if (!channel) {
+    throw new Error("WhatsApp not configured for this conversation's inbox")
   }
+  const config = channel.config
 
   const accessToken = decrypt(config.access_token)
 
@@ -338,14 +335,11 @@ async function sendInteractiveViaMeta(
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
+  const channel = await getChannelForConversation(db, input.conversationId)
+  if (!channel) {
+    throw new Error("WhatsApp not configured for this conversation's inbox")
   }
+  const config = channel.config
 
   const accessToken = decrypt(config.access_token)
 
