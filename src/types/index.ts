@@ -299,6 +299,35 @@ export interface WhatsAppConfig {
   is_coexistence?: boolean;
 }
 
+/**
+ * Instagram channel config (034_instagram_channel.sql) — one row per
+ * inbox, mirrors WhatsAppConfig. Uses the direct Instagram Login API
+ * (graph.instagram.com); `instagram_id` is the webhook routing key.
+ */
+export interface InstagramConfig {
+  id: string;
+  account_id: string;
+  user_id: string;
+  /** Inbox this channel config belongs to. */
+  inbox_id: string;
+  /** IG business account id — webhook routing key (entry[].id). */
+  instagram_id: string;
+  username?: string;
+  /** Long-lived (~60-day) token, encrypted. */
+  access_token: string;
+  /** Expiry of the long-lived token; drives the lazy refresh. */
+  token_expires_at?: string;
+  /** When the token was last refreshed (refresh only once per 24h). */
+  token_refreshed_at?: string;
+  verify_token?: string;
+  status: 'connected' | 'disconnected';
+  connected_at?: string;
+  /** Set when POST /{instagram_id}/subscribed_apps last succeeded. */
+  subscribed_apps_at?: string;
+  /** Last connect/refresh error; cleared on success. */
+  last_error?: string;
+}
+
 // Raw Meta status enum. We persist this verbatim from Meta (sync + webhook)
 // rather than collapsing to a local TitleCase set — distinctions like
 // PAUSED vs DISABLED vs IN_APPEAL drive the edit/resubmit/delete flows.
@@ -350,6 +379,26 @@ export interface MessageTemplate {
   created_at: string;
 }
 
+/** Ownership scope of a quick reply (migration 035). */
+export type QuickReplyScope = 'shared' | 'personal';
+
+/**
+ * A saved canned message ("mensagem pronta"). Triggered by typing
+ * `/<short_code>` in the composer. `content` may carry {{contact.name}} /
+ * {{agent.name}} tokens resolved at insert time (see lib/quick-replies/render).
+ * `owner_user_id` NULL = shared across the account; set = private to that agent.
+ */
+export interface QuickReply {
+  id: string;
+  account_id: string;
+  owner_user_id: string | null;
+  short_code: string;
+  content: string;
+  created_by?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Pipeline {
   id: string;
   user_id: string;
@@ -368,6 +417,45 @@ export interface PipelineStage {
 
 export type DealStatus = 'open' | 'won' | 'lost';
 
+// ============================================================
+// Products / services catalog + deal line items (migration 036)
+// ============================================================
+
+/** One-time purchase vs recurring subscription. */
+export type ProductType = 'one_time' | 'subscription';
+
+/** Fixed subscription billing presets (only set when type='subscription'). */
+export type BillingPeriod = 'monthly' | 'quarterly' | 'semiannual' | 'annual';
+
+export interface Product {
+  id: string;
+  account_id: string;
+  name: string;
+  description?: string | null;
+  type: ProductType;
+  price: number;
+  /** Required for subscriptions, null for one-time products. */
+  billing_period?: BillingPeriod | null;
+  /** Archived products stay for historical line items but hide from pickers. */
+  active: boolean;
+  created_by?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A product attached to a deal. `unit_price` is a snapshot at add time. */
+export interface DealProduct {
+  id: string;
+  deal_id: string;
+  product_id: string;
+  account_id: string;
+  quantity: number;
+  unit_price: number;
+  created_at: string;
+  /** Hydrated when the row is selected with `product:products(*)`. */
+  product?: Product;
+}
+
 export interface Deal {
   id: string;
   user_id: string;
@@ -381,8 +469,6 @@ export interface Deal {
   conversation_id?: string;
   assigned_to?: string;
   title: string;
-  value: number;
-  currency?: string;
   notes?: string;
   expected_close_date?: string;
   status?: DealStatus;
@@ -391,6 +477,12 @@ export interface Deal {
   contact?: Contact;
   stage?: PipelineStage;
   assignee?: Profile;
+  /**
+   * Line items (migration 036). The deal's monetary value derives from
+   * these as Σ(quantity × unit_price) — see `dealTotal()` in
+   * `@/lib/deals/total`. Currency is the account default.
+   */
+  deal_products?: DealProduct[];
 }
 
 export type BroadcastStatus = 'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
@@ -530,7 +622,8 @@ export interface CreateDealStepConfig {
   pipeline_id: string;
   stage_id: string;
   title: string;
-  value?: number;
+  // Note: deals no longer carry a flat value (migration 036). Value derives
+  // from line items; automation-created deals start with no line items.
 }
 
 export interface WaitStepConfig {

@@ -61,7 +61,21 @@ export async function getInboxChannel(
         config,
       }
     }
-    // 'instagram' / 'messenger' plug in here.
+    case 'instagram': {
+      const { data: config, error } = await db
+        .from('instagram_config')
+        .select('*')
+        .eq('inbox_id', inboxId)
+        .maybeSingle()
+      if (error || !config) return null
+      return {
+        inboxId,
+        accountId: inbox.account_id,
+        channelType: 'instagram',
+        config,
+      }
+    }
+    // 'messenger' plugs in here.
     default:
       return null
   }
@@ -126,6 +140,31 @@ export async function resolveWhatsAppInboxByPhoneNumberId(
     inboxId: config.inbox_id,
     accountId: config.account_id,
     channelType: 'whatsapp',
+    config,
+  }
+}
+
+/**
+ * Resolve the inbox (and account) that owns an Instagram `instagram_id`.
+ * This is the Instagram routing key for inbound webhooks (the recipient
+ * of an inbound DM = our connected business account). Returns null on
+ * zero or multiple matches (multiple => duplicate config rows, a data bug).
+ */
+export async function resolveInstagramInboxByInstagramId(
+  db: SupabaseClient,
+  instagramId: string,
+): Promise<InboxChannel | null> {
+  const { data: rows, error } = await db
+    .from('instagram_config')
+    .select('*')
+    .eq('instagram_id', instagramId)
+  if (error || !rows || rows.length !== 1) return null
+  const config = rows[0]
+  if (!config.inbox_id || !config.account_id) return null
+  return {
+    inboxId: config.inbox_id,
+    accountId: config.account_id,
+    channelType: 'instagram',
     config,
   }
 }

@@ -57,21 +57,28 @@ export async function GET() {
 
     const ids = (inboxes ?? []).map((i: { id: string }) => i.id)
 
-    // Connection status per inbox (from whatsapp_config) + member counts.
-    const [{ data: configs }, { data: members }] = await Promise.all([
+    const idFilter = ids.length ? ids : ['00000000-0000-0000-0000-000000000000']
+
+    // Connection status per inbox (per-channel config tables) + member counts.
+    const [{ data: waConfigs }, { data: igConfigs }, { data: members }] = await Promise.all([
       ctx.supabase
         .from('whatsapp_config')
         .select('inbox_id, status, registered_at, phone_number_id')
-        .in('inbox_id', ids.length ? ids : ['00000000-0000-0000-0000-000000000000']),
+        .in('inbox_id', idFilter),
+      ctx.supabase
+        .from('instagram_config')
+        .select('inbox_id, status, instagram_id, username')
+        .in('inbox_id', idFilter),
       ctx.supabase
         .from('inbox_members')
         .select('inbox_id, user_id')
-        .in('inbox_id', ids.length ? ids : ['00000000-0000-0000-0000-000000000000']),
+        .in('inbox_id', idFilter),
     ])
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const configByInbox = new Map<string, any>()
-    for (const c of configs ?? []) configByInbox.set(c.inbox_id, c)
+    for (const c of waConfigs ?? []) configByInbox.set(c.inbox_id, { ...c, _channel: 'whatsapp' })
+    for (const c of igConfigs ?? []) configByInbox.set(c.inbox_id, { ...c, _channel: 'instagram' })
     const memberCount = new Map<string, number>()
     for (const m of members ?? []) memberCount.set(m.inbox_id, (memberCount.get(m.inbox_id) ?? 0) + 1)
 
@@ -86,8 +93,12 @@ export async function GET() {
         connection: {
           configured: !!cfg,
           status: cfg?.status ?? 'disconnected',
-          registered: !!cfg?.registered_at,
+          // WhatsApp: registered for webhooks. Instagram: connected == registered
+          // (subscription happens on connect), so mirror `status`.
+          registered: cfg?._channel === 'instagram' ? cfg?.status === 'connected' : !!cfg?.registered_at,
           phone_number_id: cfg?.phone_number_id ?? null,
+          instagram_id: cfg?.instagram_id ?? null,
+          username: cfg?.username ?? null,
         },
         member_count: memberCount.get(i.id) ?? 0,
       }

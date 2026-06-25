@@ -118,7 +118,7 @@ export default function InboxPage() {
       const supabase = createClient();
       const { data, error } = await supabase
         .from("conversations")
-        .select("*, contact:contacts(*)")
+        .select("*, contact:contacts(*), inbox:inboxes(id, name, channel_type, color)")
         .eq("id", convId)
         .maybeSingle();
       if (error) {

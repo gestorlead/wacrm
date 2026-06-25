@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { formatCurrency } from '@/lib/currency';
+import { dealTotal } from '@/lib/deals/total';
 import { toast } from 'sonner';
 import type { Contact, Tag, ContactTag, ContactNote, CustomField, ContactCustomValue, Deal } from '@/types';
 import {
@@ -159,7 +160,7 @@ export function ContactDetailView({
     setLoadingDeals(true);
     const { data } = await supabase
       .from('deals')
-      .select('*, stage:pipeline_stages(*)')
+      .select('*, stage:pipeline_stages(*), deal_products(quantity, unit_price)')
       .eq('contact_id', contactId)
       .order('created_at', { ascending: false });
     setDeals((data ?? []) as Deal[]);
@@ -657,10 +658,7 @@ export function ContactDetailView({
                         <div className="mt-1.5 flex items-center justify-between text-xs text-muted-foreground">
                           <span className="flex items-center gap-1">
                             <DollarSign className="size-3" />
-                            {formatCurrency(
-                              deal.value ?? 0,
-                              deal.currency || defaultCurrency,
-                            )}
+                            {formatCurrency(dealTotal(deal), defaultCurrency)}
                           </span>
                           {deal.status && deal.status !== 'open' && (
                             <span

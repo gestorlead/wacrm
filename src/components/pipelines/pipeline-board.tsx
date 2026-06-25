@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { Plus } from "lucide-react";
 import { useAuth } from "@/hooks/use-auth";
 import { formatCurrency } from "@/lib/currency";
+import { dealTotal } from "@/lib/deals/total";
 
 interface PipelineBoardProps {
   stages: PipelineStage[];
@@ -105,10 +106,7 @@ export function PipelineBoard({
       <div className="pipeline-scroll flex snap-x snap-mandatory gap-3 overflow-x-auto pb-4 lg:snap-none">
         {sortedStages.map((stage) => {
           const stageDeals = dealsByStage.get(stage.id) ?? [];
-          const totalValue = stageDeals.reduce(
-            (s, d) => s + Number(d.value || 0),
-            0,
-          );
+          const totalValue = stageDeals.reduce((s, d) => s + dealTotal(d), 0);
           return (
             <StageColumn
               key={stage.id}
@@ -138,6 +136,7 @@ export function PipelineBoard({
               }
               onEdit={() => {}}
               isOverlay
+              currency={defaultCurrency}
             />
           </div>
         ) : null}
@@ -246,6 +245,7 @@ function StageColumn({
               deal={deal}
               stage={stage}
               onEdit={onEditDeal}
+              currency={currency}
             />
           ))
         )}
@@ -268,10 +268,12 @@ function DraggableDealCard({
   deal,
   stage,
   onEdit,
+  currency,
 }: {
   deal: Deal;
   stage: PipelineStage;
   onEdit: (deal: Deal) => void;
+  currency: string;
 }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: deal.id,
@@ -284,7 +286,7 @@ function DraggableDealCard({
       {...attributes}
       style={{ opacity: isDragging ? 0.3 : 1, touchAction: "none" }}
     >
-      <DealCard deal={deal} stage={stage} onEdit={onEdit} />
+      <DealCard deal={deal} stage={stage} onEdit={onEdit} currency={currency} />
     </div>
   );
 }

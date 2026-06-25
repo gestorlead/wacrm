@@ -100,23 +100,29 @@ export async function resolveContactInbox(
   }
 
   if (!contact) {
-    if (!isPhoneChannel) {
-      // Non-phone channels (Instagram/Messenger) need `contacts.phone` to be
-      // nullable + a generic identifier column — a future migration. Until
-      // then we can't create a contact without a phone.
-      console.error(
-        `[inbound] contact creation for non-phone channel '${channelType}' not supported yet`,
-      )
-      return null
+    // Phone channels store the source_id as the contact's phone (and dedupe
+    // on it). Non-phone channels (Instagram/Messenger) leave `phone` NULL —
+    // identity lives entirely in the `contact_inboxes.source_id` link, so
+    // the unique-on-source_id index (not phone) is what prevents duplicates.
+    // `contacts.phone` is nullable since migration 034; the generated
+    // `phone_normalized` is NULL for these rows and excluded from the
+    // per-account phone unique index.
+    const insertRow: Record<string, unknown> = {
+      account_id: accountId,
+      user_id: userId,
+      name: name || sourceId,
+      phone: isPhoneChannel ? sourceId : null,
     }
     const { data: created, error: createErr } = await db
       .from('contacts')
-      .insert({ account_id: accountId, user_id: userId, phone: sourceId, name: name || sourceId })
+      .insert(insertRow)
       .select()
       .single()
     if (createErr) {
-      // Lost a race against a concurrent inbound — re-resolve.
-      if (isUniqueViolation(createErr)) {
+      // Phone channels can lose a race against a concurrent inbound on the
+      // per-account phone unique index — re-resolve. Non-phone channels have
+      // no such constraint, so a failure there is a real error.
+      if (isPhoneChannel && isUniqueViolation(createErr)) {
         const raced = await findExistingContact(db, accountId, sourceId)
         if (raced) contact = raced
       }

@@ -11,7 +11,9 @@ import { ProfileForm } from '@/components/settings/profile-form';
 import { SecurityPanel } from '@/components/settings/security-panel';
 import { AppearancePanel } from '@/components/settings/appearance-panel';
 import { InboxesPanel } from '@/components/settings/inboxes/inboxes-panel';
+import { QuickRepliesPanel } from '@/components/settings/quick-replies/quick-replies-panel';
 import { FieldsAndTagsPanel } from '@/components/settings/fields-and-tags-panel';
+import { ProductsPanel } from '@/components/settings/products/products-panel';
 import { DealsSettings } from '@/components/settings/deals-settings';
 import { MembersTab } from '@/components/settings/members-tab';
 import {
@@ -54,7 +56,9 @@ export default function SettingsPage() {
     security: <SecurityPanel />,
     appearance: <AppearancePanel />,
     inboxes: <InboxesPanel />,
+    'quick-replies': <QuickRepliesPanel />,
     fields: <FieldsAndTagsPanel />,
+    products: <ProductsPanel />,
     deals: <DealsSettings />,
     members: <MembersTab />,
   };

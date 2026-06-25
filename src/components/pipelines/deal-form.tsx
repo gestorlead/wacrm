@@ -4,14 +4,17 @@ import { useState, useEffect } from "react";
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
-import { CURRENCIES } from "@/lib/currency";
+import { useProducts } from "@/hooks/use-products";
+import { formatCurrency } from "@/lib/currency";
 import type {
+  BillingPeriod,
   Contact,
   Conversation,
   Deal,
   DealStatus,
   PipelineStage,
   Profile,
+  ProductType,
 } from "@/types";
 import {
   Sheet,
@@ -28,10 +31,19 @@ import {
   X,
   Trash2,
   MessageSquare,
-  DollarSign,
   Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
+
+/** A product attached to the deal being edited (with snapshot price). */
+interface LineItem {
+  product_id: string;
+  name: string;
+  quantity: number;
+  unit_price: number;
+  type: ProductType;
+  billing_period: BillingPeriod | null;
+}
 
 interface DealFormProps {
   open: boolean;
@@ -54,10 +66,10 @@ export function DealForm({
 }: DealFormProps) {
   const supabase = createClient();
   const { accountId, defaultCurrency } = useAuth();
+  const { products } = useProducts({ activeOnly: true });
 
   const [title, setTitle] = useState("");
-  const [value, setValue] = useState("");
-  const [currency, setCurrency] = useState(defaultCurrency);
+  const [items, setItems] = useState<LineItem[]>([]);
   const [contactId, setContactId] = useState("");
   const [stageId, setStageId] = useState("");
   const [assignedTo, setAssignedTo] = useState("");
@@ -83,8 +95,17 @@ export function DealForm({
     setConfirmDelete(false);
     if (deal) {
       setTitle(deal.title);
-      setValue(String(deal.value ?? ""));
-      setCurrency(deal.currency || defaultCurrency);
+      // Hydrate line items from the deal's saved products (migration 036).
+      setItems(
+        (deal.deal_products ?? []).map((dp) => ({
+          product_id: dp.product_id,
+          name: dp.product?.name ?? "Product",
+          quantity: Number(dp.quantity ?? 1),
+          unit_price: Number(dp.unit_price ?? 0),
+          type: dp.product?.type ?? "one_time",
+          billing_period: dp.product?.billing_period ?? null,
+        })),
+      );
       // contact_id is nullable when the contact has been deleted
       // (migration 004: ON DELETE SET NULL). "" means "no selection".
       setContactId(deal.contact_id ?? "");
@@ -94,15 +115,14 @@ export function DealForm({
       setNotes(deal.notes ?? "");
     } else {
       setTitle("");
-      setValue("");
-      setCurrency(defaultCurrency);
+      setItems([]);
       setContactId("");
       setStageId(defaultStageId || stages[0]?.id || "");
       setAssignedTo("");
       setExpectedCloseDate("");
       setNotes("");
     }
-  }, [open, deal, defaultStageId, stages, defaultCurrency]);
+  }, [open, deal, defaultStageId, stages]);
   /* eslint-enable react-hooks/set-state-in-effect */
 
   // Load supporting data once the sheet is open
@@ -149,6 +169,68 @@ export function DealForm({
     };
   }, [open, contactId, supabase]);
 
+  const total = items.reduce((sum, it) => sum + it.quantity * it.unit_price, 0);
+
+  function addProduct(productId: string) {
+    const product = products.find((p) => p.id === productId);
+    if (!product) return;
+    setItems((prev) => {
+      // If already on the deal, bump its quantity instead of duplicating.
+      const existing = prev.find((it) => it.product_id === productId);
+      if (existing) {
+        return prev.map((it) =>
+          it.product_id === productId ? { ...it, quantity: it.quantity + 1 } : it,
+        );
+      }
+      return [
+        ...prev,
+        {
+          product_id: product.id,
+          name: product.name,
+          quantity: 1,
+          unit_price: Number(product.price), // snapshot at add time
+          type: product.type,
+          billing_period: product.billing_period ?? null,
+        },
+      ];
+    });
+  }
+
+  function updateQuantity(productId: string, quantity: number) {
+    setItems((prev) =>
+      prev.map((it) =>
+        it.product_id === productId ? { ...it, quantity: Math.max(1, quantity) } : it,
+      ),
+    );
+  }
+
+  function removeItem(productId: string) {
+    setItems((prev) => prev.filter((it) => it.product_id !== productId));
+  }
+
+  /** Replace the deal's line items with the current editor state. */
+  async function syncLineItems(dealId: string): Promise<boolean> {
+    if (!accountId) return false;
+    // Replace-all keeps the sync simple and snapshot-safe: we delete the
+    // existing rows then re-insert from state (unit_price already captured).
+    const { error: delError } = await supabase
+      .from("deal_products")
+      .delete()
+      .eq("deal_id", dealId);
+    if (delError) return false;
+
+    if (items.length === 0) return true;
+    const rows = items.map((it) => ({
+      deal_id: dealId,
+      product_id: it.product_id,
+      account_id: accountId,
+      quantity: it.quantity,
+      unit_price: it.unit_price,
+    }));
+    const { error: insError } = await supabase.from("deal_products").insert(rows);
+    return !insError;
+  }
+
   async function handleSave() {
     if (!title.trim() || !contactId || !stageId) {
       toast.error("Title, contact, and stage are required");
@@ -158,8 +240,6 @@ export function DealForm({
 
     const payload = {
       title: title.trim(),
-      value: parseFloat(value) || 0,
-      currency,
       contact_id: contactId,
       pipeline_id: pipelineId,
       stage_id: stageId,
@@ -178,6 +258,11 @@ export function DealForm({
         setSaving(false);
         return;
       }
+      if (!(await syncLineItems(deal.id))) {
+        toast.error("Deal saved, but its products could not be updated.");
+        setSaving(false);
+        return;
+      }
     } else {
       const {
         data: { session },
@@ -193,11 +278,18 @@ export function DealForm({
         setSaving(false);
         return;
       }
-      const { error } = await supabase
+      const { data: created, error } = await supabase
         .from("deals")
-        .insert({ ...payload, user_id: user.id, account_id: accountId, status: "open" });
-      if (error) {
+        .insert({ ...payload, user_id: user.id, account_id: accountId, status: "open" })
+        .select("id")
+        .single();
+      if (error || !created) {
         toast.error("Failed to create deal");
+        setSaving(false);
+        return;
+      }
+      if (!(await syncLineItems(created.id))) {
+        toast.error("Deal created, but its products could not be saved.");
         setSaving(false);
         return;
       }
@@ -284,42 +376,90 @@ export function DealForm({
 
               {linkedConversation && (
                 <Link
-                  href="/inbox"
+                  href={`/inbox?c=${linkedConversation.id}`}
                   className="mt-1 inline-flex items-center gap-1.5 self-start rounded-md bg-primary/10 px-2 py-1 text-xs text-primary hover:bg-primary/20"
                 >
                   <MessageSquare className="h-3 w-3" />
-                  Link to Conversation
+                  Open Conversation
                 </Link>
               )}
             </div>
 
-            <div className="grid grid-cols-[1fr_110px] gap-3">
-              <div className="grid gap-2">
-                <Label className="text-muted-foreground">Value</Label>
-                <div className="relative">
-                  <DollarSign className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    type="number"
-                    value={value}
-                    onChange={(e) => setValue(e.target.value)}
-                    placeholder="0"
-                    className="border-border bg-muted pl-7 text-foreground"
-                  />
+            <div className="grid gap-2">
+              <Label className="text-muted-foreground">Products / Services</Label>
+
+              {items.length > 0 && (
+                <div className="divide-y divide-border rounded-lg border border-border">
+                  {items.map((it) => (
+                    <div key={it.product_id} className="flex items-center gap-2 p-2.5">
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium text-foreground">
+                          {it.name}
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          {formatCurrency(it.unit_price, defaultCurrency)}
+                          {it.type === "subscription" && it.billing_period
+                            ? ` / ${it.billing_period}`
+                            : ""}{" "}
+                          · {formatCurrency(it.quantity * it.unit_price, defaultCurrency)}
+                        </p>
+                      </div>
+                      <Input
+                        type="number"
+                        min="1"
+                        value={it.quantity}
+                        onChange={(e) =>
+                          updateQuantity(it.product_id, parseInt(e.target.value, 10) || 1)
+                        }
+                        className="h-8 w-16 border-border bg-muted text-center text-foreground"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeItem(it.product_id)}
+                        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-red-400"
+                        title="Remove"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              </div>
-              <div className="grid gap-2">
-                <Label className="text-muted-foreground">Currency</Label>
+              )}
+
+              <div className="flex items-center gap-2">
                 <select
-                  value={currency}
-                  onChange={(e) => setCurrency(e.target.value)}
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) addProduct(e.target.value);
+                  }}
                   className="h-9 w-full rounded-lg border border-border bg-muted px-2.5 text-sm text-foreground outline-none focus:border-primary"
                 >
-                  {CURRENCIES.map((c) => (
-                    <option key={c.code} value={c.code}>
-                      {c.code}
+                  <option value="">+ Add a product…</option>
+                  {products.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} — {formatCurrency(p.price, defaultCurrency)}
+                      {p.type === "subscription" && p.billing_period
+                        ? ` / ${p.billing_period}`
+                        : ""}
                     </option>
                   ))}
                 </select>
+              </div>
+              {products.length === 0 && (
+                <p className="text-xs text-muted-foreground">
+                  No products yet.{" "}
+                  <Link href="/settings?tab=products" className="text-primary hover:underline">
+                    Create one in Settings
+                  </Link>
+                  .
+                </p>
+              )}
+
+              <div className="flex items-center justify-between rounded-lg bg-muted/50 px-3 py-2">
+                <span className="text-sm text-muted-foreground">Deal total</span>
+                <span className="text-sm font-bold text-primary">
+                  {formatCurrency(total, defaultCurrency)}
+                </span>
               </div>
             </div>
 

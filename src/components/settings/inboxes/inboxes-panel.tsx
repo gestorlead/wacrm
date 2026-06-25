@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Plus, Loader2, ChevronRight } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -46,6 +47,27 @@ export function InboxesPanel() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Instagram OAuth returns the browser here with ?instagram=connected|error.
+  // Surface the result and strip the params so a refresh doesn't re-toast.
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  useEffect(() => {
+    const status = searchParams.get('instagram');
+    if (!status) return;
+    if (status === 'connected') {
+      toast.success('Instagram conectado!');
+      void load();
+    } else if (status === 'error') {
+      toast.error(searchParams.get('reason') || 'Falha ao conectar o Instagram');
+    }
+    const params = new URLSearchParams(searchParams.toString());
+    params.delete('instagram');
+    params.delete('reason');
+    params.delete('inbox_id');
+    const qs = params.toString();
+    router.replace(`/settings${qs ? `?${qs}` : ''}`);
+  }, [searchParams, router, load]);
 
   const openInbox = (id: string) => setView({ mode: 'detail', inboxId: id });
   const startNew = () => setView({ mode: 'new' });
