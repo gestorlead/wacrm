@@ -5,6 +5,7 @@ import {
   useRef,
   useCallback,
   useEffect,
+  useMemo,
   KeyboardEvent,
 } from "react";
 import {
@@ -36,6 +37,9 @@ import {
   MEDIA_MAX_BYTES_BY_KIND,
 } from "@/lib/storage/upload-media";
 import { ReplyQuote } from "./reply-quote";
+import { QuickReplyPicker } from "./quick-reply-picker";
+import { renderQuickReply, type QuickReplyVars } from "@/lib/quick-replies/render";
+import type { QuickReply } from "@/types";
 
 /** Media content types an agent can send from the composer. */
 export type ComposerMediaKind = "image" | "video" | "document" | "audio";
@@ -98,6 +102,44 @@ interface MessageComposerProps {
   onOpenTemplates: () => void;
   replyTo?: ReplyDraft | null;
   onClearReply?: () => void;
+  /** Quick replies (mensagens prontas) the agent can trigger with `/`. */
+  quickReplies?: QuickReply[];
+  /** Values used to resolve {{contact.*}} / {{agent.*}} tokens at insert. */
+  quickReplyVars?: QuickReplyVars;
+}
+
+/** Cap on how many matches the `/` picker shows at once. */
+const QUICK_REPLY_PICKER_LIMIT = 8;
+
+/**
+ * Detect a `/<query>` token immediately before the caret. The trigger is a
+ * `/` at the very start of the input or right after whitespace, with no
+ * whitespace between it and the caret. Returns the token's start offset and
+ * the typed query, or null when the caret isn't inside such a token.
+ */
+function detectQuickReplyToken(
+  value: string,
+  caret: number,
+): { start: number; query: string } | null {
+  const before = value.slice(0, caret);
+  const match = /(^|\s)\/([^\s/]*)$/.exec(before);
+  if (!match) return null;
+  return { start: caret - match[2].length - 1, query: match[2] };
+}
+
+/** Filter quick replies by the typed query — prefix matches first. */
+function filterQuickReplies(items: QuickReply[], query: string): QuickReply[] {
+  const q = query.toLowerCase();
+  const matched = q
+    ? items.filter((r) => r.short_code.toLowerCase().includes(q))
+    : items.slice();
+  matched.sort((a, b) => {
+    const ap = a.short_code.toLowerCase().startsWith(q) ? 0 : 1;
+    const bp = b.short_code.toLowerCase().startsWith(q) ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    return a.short_code.localeCompare(b.short_code);
+  });
+  return matched.slice(0, QUICK_REPLY_PICKER_LIMIT);
 }
 
 function formatDuration(seconds: number): string {
@@ -119,10 +161,24 @@ export function MessageComposer({
   onOpenTemplates,
   replyTo,
   onClearReply,
+  quickReplies = [],
+  quickReplyVars,
 }: MessageComposerProps) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Quick-reply `/` picker. `token` holds the active `/<query>` span being
+  // typed; null when no trigger is open. `qrIndex` is the highlighted row.
+  // The token is only ever set for users who can send (see handleChange),
+  // so reaching render with a token implies the picker is allowed.
+  const [token, setToken] = useState<{ start: number; query: string } | null>(null);
+  const [qrIndex, setQrIndex] = useState(0);
+  const qrMatches = useMemo(
+    () => (token ? filterQuickReplies(quickReplies, token.query) : []),
+    [token, quickReplies],
+  );
+  const qrOpen = qrMatches.length > 0;
 
   // Media attachment state. `draft` holds an uploaded-but-not-yet-sent
   // attachment; `busy` covers the upload/transcode window.
@@ -197,6 +253,7 @@ export function MessageComposer({
     try {
       onSend(trimmed, replyTo?.id);
       setText("");
+      setToken(null);
       if (textareaRef.current) {
         textareaRef.current.style.height = "auto";
       }
@@ -205,22 +262,79 @@ export function MessageComposer({
     }
   }, [text, sending, sessionExpired, onSend, replyTo?.id]);
 
+  // Replace the active `/<query>` token with a chosen quick reply, its
+  // {{contact.*}}/{{agent.*}} tokens resolved, then restore the caret after
+  // the inserted text.
+  const selectQuickReply = useCallback(
+    (item: QuickReply) => {
+      if (!token) return;
+      const rendered = renderQuickReply(item.content, quickReplyVars ?? {});
+      const end = token.start + 1 + token.query.length;
+      const next = text.slice(0, token.start) + rendered + text.slice(end);
+      const caret = token.start + rendered.length;
+      setText(next);
+      setToken(null);
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (el) {
+          el.focus();
+          el.setSelectionRange(caret, caret);
+        }
+        adjustHeight();
+      });
+    },
+    [token, text, quickReplyVars, adjustHeight],
+  );
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      // While the picker is open, arrows/enter/tab/esc drive it instead of
+      // the textarea's normal newline/send behaviour.
+      if (qrOpen) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setQrIndex((i) => (i + 1) % qrMatches.length);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setQrIndex((i) => (i - 1 + qrMatches.length) % qrMatches.length);
+          return;
+        }
+        if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+          e.preventDefault();
+          selectQuickReply(qrMatches[qrIndex]);
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setToken(null);
+          return;
+        }
+      }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         handleSend();
       }
     },
-    [handleSend]
+    [qrOpen, qrMatches, qrIndex, selectQuickReply, handleSend]
   );
 
   const handleChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      setText(e.target.value);
+      const value = e.target.value;
+      setText(value);
       adjustHeight();
+      // Read-only / expired sessions never open the picker.
+      if (readOnly || sessionExpired) {
+        setToken(null);
+        return;
+      }
+      const caret = e.target.selectionStart ?? value.length;
+      setToken(detectQuickReplyToken(value, caret));
+      setQrIndex(0);
     },
-    [adjustHeight]
+    [adjustHeight, readOnly, sessionExpired]
   );
 
   // Upload a captured file to chat-media and stage it as a draft.
@@ -471,7 +585,15 @@ export function MessageComposer({
           </Button>
         </div>
       ) : (
-        <div className="flex items-end gap-2">
+        <div className="relative flex items-end gap-2">
+          {qrOpen && (
+            <QuickReplyPicker
+              items={qrMatches}
+              activeIndex={qrIndex}
+              onSelect={selectQuickReply}
+              onActiveIndexChange={setQrIndex}
+            />
+          )}
           {/* Attach menu — photo / video / document / voice. */}
           <DropdownMenu>
             <DropdownMenuTrigger

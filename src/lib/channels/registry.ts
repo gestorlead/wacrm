@@ -43,8 +43,8 @@ export const CHANNELS: Record<ChannelType, ChannelDef> = {
     type: 'instagram',
     label: 'Instagram',
     icon: Camera,
-    status: 'coming_soon',
-    description: 'Receba DMs do Instagram. Em breve.',
+    status: 'available',
+    description: 'Receba e responda DMs do Instagram (Meta).',
     accent: 'bg-pink-500/10 text-pink-600',
   },
   messenger: {

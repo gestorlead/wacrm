@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   wacrm:
-    image: wacrm:latest
+    image: wacrm:products-2
     environment:
       - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
       - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
@@ -14,6 +14,10 @@ services:
       - META_API_VERSION=${META_API_VERSION}
       - NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL}
       - AUTOMATION_CRON_SECRET=${AUTOMATION_CRON_SECRET}
+      # Instagram (Instagram Login API) — runtime secrets for OAuth + webhook.
+      - INSTAGRAM_APP_ID=${INSTAGRAM_APP_ID}
+      - INSTAGRAM_APP_SECRET=${INSTAGRAM_APP_SECRET}
+      - INSTAGRAM_WEBHOOK_VERIFY_TOKEN=${INSTAGRAM_WEBHOOK_VERIFY_TOKEN}
     deploy:
       replicas: 1
       placement:

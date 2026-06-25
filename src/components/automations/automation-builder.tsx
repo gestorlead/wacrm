@@ -152,7 +152,7 @@ function blankConfig(type: AutomationStepType): Record<string, unknown> {
     case "update_contact_field":
       return { field: "name", value: "" }
     case "create_deal":
-      return { pipeline_id: "", stage_id: "", title: "", value: 0 }
+      return { pipeline_id: "", stage_id: "", title: "" }
     case "wait":
       return { amount: 1, unit: "hours" }
     case "condition":
@@ -1146,14 +1146,8 @@ function StepEditor({
               className="bg-muted text-foreground"
             />
           </FieldBlock>
-          <FieldBlock label="Value">
-            <Input
-              type="number"
-              value={(cfg.value as number) ?? 0}
-              onChange={(e) => set({ value: Number(e.target.value) })}
-              className="bg-muted text-foreground"
-            />
-          </FieldBlock>
+          {/* Deal value derives from line items (migration 036); an
+              automation-created deal starts with no products. */}
         </>
       )
     case "wait":

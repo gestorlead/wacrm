@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { ArrowLeft, Check, Loader2, Smartphone, Settings2 } from 'lucide-react';
+import { ArrowLeft, Check, Loader2, Smartphone, Settings2, Camera } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { Button } from '@/components/ui/button';
@@ -57,6 +57,10 @@ export function NewInboxWizard({
             setStep('agents');
           }}
         />
+      )}
+
+      {step === 'config' && channel === 'instagram' && (
+        <InstagramConfigStep onBack={() => setStep('channel')} />
       )}
 
       {step === 'agents' && createdInboxId && (
@@ -304,6 +308,56 @@ function ManualWhatsAppForm({ onCreated }: { onCreated: (inboxId: string) => voi
         </Button>
       </div>
     </Card>
+  );
+}
+
+function InstagramConfigStep({ onBack }: { onBack: () => void }) {
+  const [connecting, setConnecting] = useState(false);
+
+  // OAuth is a full-page redirect: we leave the SPA, Instagram authorizes,
+  // and Meta returns the browser to /settings?tab=inboxes&instagram=...
+  // The inboxes panel reads that param and shows the result; the inbox is
+  // created server-side by /api/instagram/callback.
+  const connect = () => {
+    setConnecting(true);
+    window.location.href = '/api/instagram/authorize';
+  };
+
+  return (
+    <div>
+      <SettingsPanelHead
+        title="Conectar Instagram"
+        description="Conecte uma conta profissional do Instagram para receber e responder DMs no wacrm."
+      />
+      <Card className="space-y-4 p-5">
+        <div className="flex items-start gap-3">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-pink-500/10 text-pink-600">
+            <Camera className="size-5" />
+          </span>
+          <div className="min-w-0">
+            <h3 className="font-medium text-foreground">Login com Instagram</h3>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              Você será redirecionado ao Instagram para autorizar o acesso às
+              mensagens. Ao voltar, o inbox será criado automaticamente.
+            </p>
+            <ul className="mt-2 space-y-1 text-xs text-muted-foreground">
+              <li>✓ Conta profissional (Business/Creator)</li>
+              <li>✓ Receba e responda DMs, story replies e reações</li>
+              <li>✓ Janela de 24h (tag de agente humano fora dela)</li>
+            </ul>
+          </div>
+        </div>
+        <Button onClick={connect} disabled={connecting} className="w-full sm:w-auto">
+          {connecting ? <Loader2 className="size-4 animate-spin" /> : null}
+          Conectar com Instagram
+        </Button>
+      </Card>
+      <div className="mt-5">
+        <Button variant="ghost" onClick={onBack}>
+          Voltar
+        </Button>
+      </div>
+    </div>
   );
 }
 

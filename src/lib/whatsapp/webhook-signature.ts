@@ -31,7 +31,23 @@ export function verifyMetaWebhookSignature(
     )
     return false
   }
+  return verifyHubSignature(rawBody, signatureHeader, secret)
+}
 
+/**
+ * Generic `X-Hub-Signature-256` verification against an explicit secret.
+ * Used by channels that sign with a different app secret than WhatsApp —
+ * e.g. Instagram (INSTAGRAM_APP_SECRET). Fails closed on a missing secret.
+ */
+export function verifyHubSignature(
+  rawBody: string,
+  signatureHeader: string | null,
+  secret: string | undefined,
+): boolean {
+  if (!secret) {
+    console.error('[webhook] app secret not set — rejecting request.')
+    return false
+  }
   if (!signatureHeader) return false
   if (!signatureHeader.startsWith('sha256=')) return false
 

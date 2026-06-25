@@ -16,6 +16,7 @@ import type {
   ResponseTimeBucket,
   ResponseTimeSummary,
 } from './types'
+import { dealTotal } from '@/lib/deals/total'
 
 // ------------------------------------------------------------
 // All client-side aggregation. RLS scopes every query to the
@@ -61,7 +62,7 @@ export async function loadMetrics(db: DB): Promise<MetricsBundle> {
       .select('id', { count: 'exact', head: true })
       .gte('created_at', yesterdayStart)
       .lt('created_at', todayStart),
-    db.from('deals').select('value, status').eq('status', 'open'),
+    db.from('deals').select('deal_products(quantity, unit_price)').eq('status', 'open'),
     db
       .from('messages')
       .select('id', { count: 'exact', head: true })
@@ -75,8 +76,11 @@ export async function loadMetrics(db: DB): Promise<MetricsBundle> {
       .lt('created_at', todayStart),
   ])
 
-  const openDealsRows = (openDeals.data ?? []) as { value: number | null }[]
-  const openDealsValue = openDealsRows.reduce((sum, d) => sum + (d.value ?? 0), 0)
+  // Deal value derives from line items (migration 036): Σ(qty × unit_price).
+  const openDealsRows = (openDeals.data ?? []) as {
+    deal_products: { quantity: number | null; unit_price: number | null }[] | null
+  }[]
+  const openDealsValue = openDealsRows.reduce((sum, d) => sum + dealTotal(d), 0)
 
   return {
     activeConversations: {
@@ -133,18 +137,25 @@ export async function loadConversationsSeries(
 export async function loadPipelineDonut(db: DB): Promise<PipelineDonutData> {
   const [stagesRes, dealsRes] = await Promise.all([
     db.from('pipeline_stages').select('id, name, color, pipeline_id, position').order('position'),
-    db.from('deals').select('stage_id, value, status').eq('status', 'open'),
+    db
+      .from('deals')
+      .select('stage_id, deal_products(quantity, unit_price)')
+      .eq('status', 'open'),
   ])
 
   const stages =
     (stagesRes.data ?? []) as { id: string; name: string; color: string }[]
-  const deals = (dealsRes.data ?? []) as { stage_id: string; value: number | null }[]
+  // Deal value derives from line items (migration 036): Σ(qty × unit_price).
+  const deals = (dealsRes.data ?? []) as {
+    stage_id: string
+    deal_products: { quantity: number | null; unit_price: number | null }[] | null
+  }[]
 
   const byStage = new Map<string, { count: number; total: number }>()
   for (const d of deals) {
     const row = byStage.get(d.stage_id) ?? { count: 0, total: 0 }
     row.count += 1
-    row.total += d.value ?? 0
+    row.total += dealTotal(d)
     byStage.set(d.stage_id, row)
   }
 

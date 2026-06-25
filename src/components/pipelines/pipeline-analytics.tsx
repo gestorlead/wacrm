@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useAuth } from "@/hooks/use-auth";
 import { formatCurrency } from "@/lib/currency";
+import { dealTotal } from "@/lib/deals/total";
 
 interface PipelineAnalyticsProps {
   stages: PipelineStage[];
@@ -57,7 +58,7 @@ export function PipelineAnalytics({ stages, deals }: PipelineAnalyticsProps) {
     const openDeals = active.filter((d) => d.status !== "won");
 
     const totalCount = active.length;
-    const totalValue = active.reduce((sum, d) => sum + Number(d.value || 0), 0);
+    const totalValue = active.reduce((sum, d) => sum + dealTotal(d), 0);
     const avgValue = totalCount > 0 ? totalValue / totalCount : 0;
 
     const stageById = new Map(sortedStages.map((s) => [s.id, s]));
@@ -65,7 +66,7 @@ export function PipelineAnalytics({ stages, deals }: PipelineAnalyticsProps) {
       const stage = stageById.get(d.stage_id);
       if (!stage) return sum;
       const prob = computeStageProbability(stage, sortedStages);
-      return sum + Number(d.value || 0) * prob;
+      return sum + dealTotal(d) * prob;
     }, 0);
 
     const now = new Date();

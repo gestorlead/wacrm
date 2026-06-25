@@ -46,6 +46,8 @@ import {
 } from "./message-composer";
 import { deleteAccountMedia } from "@/lib/storage/upload-media";
 import { TemplatePicker } from "./template-picker";
+import { useQuickReplies } from "@/hooks/use-quick-replies";
+import type { QuickReplyVars } from "@/lib/quick-replies/render";
 import { buildReplyPreview } from "./reply-quote";
 import { toast } from "sonner";
 
@@ -53,6 +55,18 @@ interface ReplyDraft {
   id: string;
   authorLabel: string;
   preview: string;
+}
+
+/**
+ * Pick the send endpoint for a conversation based on its inbox channel.
+ * Instagram conversations go through /api/instagram/send; everything else
+ * (WhatsApp) keeps the existing route. Falls back to WhatsApp when the
+ * inbox channel isn't hydrated on the conversation.
+ */
+function sendEndpointFor(conversation: Conversation): string {
+  return conversation.inbox?.channel_type === "instagram"
+    ? "/api/instagram/send"
+    : "/api/whatsapp/send";
 }
 
 function renderTemplateBody(body: string, params: string[]): string {
@@ -165,7 +179,8 @@ export function MessageThread({
   contactPanelOpen,
   onToggleContactPanel,
 }: MessageThreadProps) {
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
+  const { quickReplies } = useQuickReplies();
   const { getPresence, getRow, now } = usePresence();
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -459,7 +474,7 @@ export function MessageThread({
       setReplyTo(null);
 
       try {
-        const res = await fetch("/api/whatsapp/send", {
+        const res = await fetch(sendEndpointFor(conversation), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -523,7 +538,7 @@ export function MessageThread({
       setReplyTo(null);
 
       try {
-        const res = await fetch("/api/whatsapp/send", {
+        const res = await fetch(sendEndpointFor(conversation), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -670,6 +685,33 @@ export function MessageThread({
   }, [reactions]);
 
   const contactDisplayName = contact?.name || contact?.phone || "Customer";
+
+  // Values for resolving {{contact.*}} / {{agent.*}} tokens when an agent
+  // inserts a quick reply. first/last name are split off the full name —
+  // neither contacts nor profiles store them separately.
+  const quickReplyVars = useMemo<QuickReplyVars>(() => {
+    const split = (full?: string | null) => {
+      const parts = (full ?? "").trim().split(/\s+/).filter(Boolean);
+      return { first: parts[0] ?? "", last: parts.slice(1).join(" ") };
+    };
+    const c = split(contact?.name);
+    const a = split(profile?.full_name);
+    return {
+      contact: {
+        name: contact?.name ?? "",
+        first_name: c.first,
+        last_name: c.last,
+        phone: contact?.phone ?? "",
+        email: contact?.email ?? "",
+      },
+      agent: {
+        name: profile?.full_name ?? "",
+        first_name: a.first,
+        last_name: a.last,
+        email: profile?.email ?? "",
+      },
+    };
+  }, [contact?.name, contact?.phone, contact?.email, profile?.full_name, profile?.email]);
 
   // Author label for a quoted message: "You" when we sent the parent,
   // contact name when the customer sent it.
@@ -1079,6 +1121,8 @@ export function MessageThread({
         onOpenTemplates={handleOpenTemplates}
         replyTo={replyTo}
         onClearReply={() => setReplyTo(null)}
+        quickReplies={quickReplies}
+        quickReplyVars={quickReplyVars}
       />
 
       <TemplatePicker
